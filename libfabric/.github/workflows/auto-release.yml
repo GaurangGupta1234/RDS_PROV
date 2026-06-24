@@ -1,0 +1,63 @@
+name: Auto Release
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  release-build:
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'release')
+    uses: ./.github/workflows/build-dist-tarballs.yml
+    with:
+      source_ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.base.sha }}
+      build_fabtests: true
+    permissions:
+      contents: read
+      packages: read
+
+  release:
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'release')
+    needs: release-build
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Download release artifacts
+      uses: actions/download-artifact@v8
+      with:
+        name: release-artifacts
+        path: release-artifacts
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v3
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ needs.release-build.outputs.tag }}
+        name: Libfabric ${{ needs.release-build.outputs.version }}
+        target_commitish: ${{ needs.release-build.outputs.source_sha }}
+        draft: true
+        body: |
+          The OpenFabrics Interfaces Working Group (OFIWG) and the libfabric open-source community are pleased to announce the release of version ${{ needs.release-build.outputs.version }} of libfabric. See [NEWS.md](https://github.com/${{ github.repository }}/blob/${{ needs.release-build.outputs.tag }}/NEWS.md) for the list of features and enhancements that have been added since the last release. Installation instructions are available in the [README.md](https://github.com/${{ github.repository }}/blob/${{ needs.release-build.outputs.tag }}/README.md) file in the source tree or at the project's homepage.
+
+          Download the distribution tarballs below to get started:
+
+          **sha512 sums**
+          ```
+          ${{ needs.release-build.outputs.sha512_sums }}
+          ```
+
+          **md5sums**
+          ```
+          ${{ needs.release-build.outputs.md5_sums }}
+          ```
+
+          ${{ github.event.pull_request.body }}
+        files: |
+          release-artifacts/libfabric-*.tar.gz
+          release-artifacts/libfabric-*.tar.bz2
+          release-artifacts/fabtests-*.tar.gz
+          release-artifacts/fabtests-*.tar.bz2

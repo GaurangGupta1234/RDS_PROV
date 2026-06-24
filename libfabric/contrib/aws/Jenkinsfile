@@ -1,0 +1,423 @@
+/* SPDX-License-Identifier: BSD-2-Clause OR GPL-2.0-only */
+/* SPDX-FileCopyrightText: Copyright Amazon.com, Inc. or its affiliates. All rights reserved. */
+// Use milestones to abort old builds when the user force pushes
+def buildNumber = env.BUILD_NUMBER as int
+if (buildNumber > 1) milestone(buildNumber - 1)
+milestone(buildNumber)
+
+
+import groovy.transform.Field
+@Field boolean build_ok = true
+@Field def venv_path = "/tmp/venv"
+@Field def portafiducia_path = "/tmp/PortaFiducia"
+@Field def subspace_nightly_tests_path = "/tmp/SubspaceNightlyTests"
+@Field def samwise_test_runner_path = "/tmp/SamwiseTestRunner"
+@Field def samwise_test_schema_path = "/tmp/SamwiseTestSchema"
+
+
+def get_account_id() {
+    return sh (
+        script: "aws sts get-caller-identity --query Account --output text | tr -dc 0-9",
+        returnStdout: true
+    )
+}
+
+def get_portafiducia_download_path() {
+    /* Stable Portafiducia tarball */
+    def AWS_ACCOUNT_ID = get_account_id()
+    return "s3://libfabric-ci-${AWS_ACCOUNT_ID}-us-west-2/portafiducia/portafiducia.tar.gz"
+}
+
+def download_and_extract_portafiducia(outputDir) {
+    /* Download PortaFiducia tarball from S3 and extract to outputDir */
+    def tempPath = "/tmp/portafiducia.tar.gz"
+    def downloadPath = this.get_portafiducia_download_path()
+    sh """
+        mkdir -p ${outputDir}
+        aws s3 cp ${downloadPath} ${tempPath}
+        tar xf ${tempPath} -C ${outputDir}
+        echo '----- PortaFiducia version -----'
+        cat ${outputDir}/portafiducia_version.log
+        echo '--------------------------------'
+    """
+}
+
+def install_porta_fiducia() {
+    /*
+     * Install PortaFiducia in a (new) virtual environment.
+     */
+    sh """
+        python3 -m venv ${venv_path}
+        . ${venv_path}/bin/activate
+        pip install --upgrade pip
+        pip install --upgrade awscli
+        pip install -e ${portafiducia_path}
+        pwd
+        test -f PortaFiducia/portafiducia_version.log && cat PortaFiducia/portafiducia_version.log || true
+    """
+}
+
+def get_testing_packages_download_path() {
+    def AWS_ACCOUNT_ID = get_account_id()
+    return "s3://libfabric-ci-tests-${AWS_ACCOUNT_ID}-us-west-2/"
+}
+
+def download_testing_package(String s3Folder, String localDir) {
+    def s3Base = get_testing_packages_download_path()
+    try {
+        sh "mkdir -p ${localDir} && aws s3 cp ${s3Base}${s3Folder}/ ${localDir}/ --recursive"
+    } catch (Exception e) {
+        unstable("Failed to download ${s3Folder}: ${e.getMessage()}")
+    }
+}
+
+// S3 folder names use hyphens; --test-suite-package flag uses underscores.
+// Keep these two forms in sync.
+def download_all_testing_packages() {
+    def packages = [
+        ['subspace-nightly-tests', subspace_nightly_tests_path],
+        ['samwise-test-runner', samwise_test_runner_path],
+        ['samwise-test-schema', samwise_test_schema_path],
+    ]
+    packages.each { pkg ->
+        download_testing_package(pkg[0], pkg[1])
+    }
+}
+
+def kill_all_clusters(instance_type, region) {
+    def instance_type_without_period = sh(
+        script: "echo ${instance_type.take(10)} | tr -d '.\\n'",
+        returnStdout: true
+    )
+    sh ". ${venv_path}/bin/activate; ${portafiducia_path}/scripts/delete_manual_cluster.py --cluster-name \'*${instance_type_without_period}*\' --region ${region} || true"
+}
+
+def run_test_orchestrator_once(run_name, build_tag, os, instance_type, instance_count, region, addl_args) {
+    /*
+     * Run PortaFiducia/tests/test_orchestrator.py with given command line arguments
+     * param@ args: str, the command line arguments
+     */
+    if (instance_type == "trn2.48xlarge") {
+        kill_all_clusters(instance_type, region)
+    }
+
+    def cluster_name = get_cluster_name(build_tag, os, instance_type)
+    def args = "--os ${os} --instance-type ${instance_type} --instance-count ${instance_count} --region ${region} --cluster-name ${cluster_name} ${addl_args} --junit-xml outputs/${cluster_name}.xml"
+    sh ". ${venv_path}/bin/activate; cd ${portafiducia_path}/tests && ./test_orchestrator.py ${args}"
+}
+
+def get_random_string(len) {
+    def s = sh (
+        script: "cat /dev/urandom | LC_ALL=C tr -dc A-Za-z0-9 | head -c ${len}",
+        returnStdout: true
+    )
+    return s
+}
+
+def get_cluster_name_prefix(build_tag) {
+    def prefix = sh(
+                script: "echo ${build_tag} | sed \"s/^jenkins-//g\" | sed \"s/ //g\" | tr -d '.\\n'",
+                returnStdout: true
+            )
+    return prefix.take(28)
+}
+
+def get_cluster_name(build_tag, os, instance_type) {
+    /*
+     * Compose the cluster name. Pcluster requires a cluster name under 60 characters.
+     * cluster name cannot have ".".
+     * Jenkins does not allow groovy to use the replace() method
+     * of string. Therefore we used shell command sed to replace "." with ""
+     */
+    def cluster_name = sh(
+                        script: "echo '${get_cluster_name_prefix(build_tag)}-${os.take(10)}-${instance_type.take(10)}-'${get_random_string(8)} | tr -d '.\\n'",
+                        returnStdout: true
+                     )
+
+    return cluster_name
+}
+
+/*
+ * Paths that should NOT trigger PR CI testing. An exclude list is used instead
+ * of an include list so that new paths trigger CI by default. At worst this
+ * results in extra testing on non-relevant code, but avoids missing coverage
+ * on relevant code which is much worse.
+ * Current implicit include list (paths NOT excluded):
+ *   Providers: prov/coll/, prov/efa/, prov/hook/, prov/mrail/, prov/rxd/, prov/rxm/,
+ *              prov/shm/, prov/sm2/, prov/sockets/, prov/tcp/, prov/udp/, prov/util/
+ *   Core:      src/, include/
+ *   Tests:     fabtests/
+ *   CI:        contrib/aws/
+ *   Build:     Makefile.am, configure.ac, autogen.sh, config/
+ *   Windows:   libfabric.vcxproj, libfabric.sln, Libfabric.Build.Default.props,
+ *              libfabric.def, *.vcxproj.filters, strerror.vcxproj, pingpong.vcxproj,
+ *              info.vcxproj, libfabric.pc.in, libfabric.map.in, libfabric.spec.in
+ */
+@Field def ci_skip_paths = [
+    // Documentation
+    "man/",
+    "docs/",
+    "NEWS.md",
+    "AUTHORS",
+    "CONTRIBUTORS",
+    "COPYING",
+    "README",
+    "README.md",
+    "SECURITY.md",
+    // CI configs not related to AWS PR CI
+    ".github/",
+    ".gitignore",
+    ".gitattributes",
+    ".mailmap",
+    ".clang-format",
+    ".appveyor.yml",
+    ".appveyor.ps1",
+    ".travis.yml",
+    // Providers excluded from AWS CI (unlisted providers will trigger CI)
+    "prov/cxi/",
+    "prov/lnx/",
+    "prov/lpp/",
+    "prov/opx/",
+    "prov/psm2/",
+    "prov/psm3/",
+    "prov/ucx/",
+    "prov/usnic/",
+    "prov/verbs/",
+    // Other non-CI-relevant paths
+    "bindings/",  // Bindings have a Github action test
+    "Cargo.toml",
+    "examples/",
+    "util/",
+    "contrib/cray/",
+    "contrib/intel/",
+    "contrib/man2pdf/",
+    "contrib/buildrpm/",
+]
+
+def check_for_relevant_changes() {
+    sh "git fetch origin ${env.CHANGE_TARGET}:refs/remotes/origin/${env.CHANGE_TARGET} --no-tags --no-recurse-submodules"
+    def all_changes = sh(
+        script: "git diff --name-only origin/${env.CHANGE_TARGET}...HEAD",
+        returnStdout: true
+    ).trim()
+    if (!all_changes) {
+        echo "No changes detected, skipping tests."
+        env.SKIP_TESTS = 'true'
+        return
+    }
+    def relevant = all_changes.split('\n').findAll { file ->
+        !ci_skip_paths.any { path -> file.startsWith(path) }
+    }
+    if (relevant) {
+        echo "Relevant changes detected:\n${relevant.join('\n')}"
+    } else {
+        echo "No relevant changes found in monitored paths. All changes:\n${all_changes}"
+        currentBuild.result = 'SUCCESS'
+        env.SKIP_TESTS = 'true'
+    }
+}
+
+def post_build_actions() {
+    if (env.SKIP_TESTS == 'true') {
+        return
+    }
+    sh "rm -rf \$PWD/outputs && cp -r ${portafiducia_path}/tests/outputs/ \${PWD}/outputs"
+    sh 'find outputs -name "*.xml" | xargs du -shc'
+    junit testResults: 'outputs/**/*.xml', keepLongStdio: false
+    archiveArtifacts artifacts: 'outputs/**/*.*'
+    // Try To Cleanup Resources
+    def regions = ["us-east-1", "eu-north-1", "us-west-2", "ap-southeast-4"]
+    def cluster_name_prefix = get_cluster_name_prefix(env.BUILD_TAG)
+    regions.each { region ->
+        sh ". ${venv_path}/bin/activate; ${portafiducia_path}/scripts/delete_manual_cluster.py --cluster-name '${cluster_name_prefix}*' --region ${region}"
+    }
+    // Windows Cluster, has a different name
+    sh """
+        . ${venv_path}/bin/activate
+        ${portafiducia_path}/scripts/delete_manual_cluster.py --cluster-name WindowsLibfabricCi_${env.CHANGE_ID}_*
+    """
+}
+
+def get_single_node_windows_test_stage_with_lock(stage_name, lock_label) {
+    /*
+     * Get Windows Stage
+     */
+    return {
+        stage("${stage_name}") {
+            lock(label: lock_label, quantity: 1) {
+                sh """
+                    . ${venv_path}/bin/activate;
+                    cd ${portafiducia_path}/scripts;
+                    export PULL_REQUEST_ID=${env.CHANGE_ID};
+                    env AWS_DEFAULT_REGION=us-west-2 ./test_orchestrator_windows.py --odcr cr-0cdbaaac459287611 --ci public --s3-bucket-name libfabric-ci-windows-prod-test-output --pull-request-id ${env.CHANGE_ID};
+                """
+            }
+        }
+    }
+
+}
+
+def get_test_stage_with_lock(stage_name, build_tag, os, instance_type, instance_count, region, lock_label, addl_args) {
+    /*
+     * Generate a single test stage that run test_orchestrator.py with the given parameters.
+     * param@ stage_name: the name of the stage
+     * param@ build_tag: the BUILD_TAG env generated by Jenkins
+     * param@ os: the operating system for the test stage.
+     * param@ instance_type: the instance type for the test stage.
+     * param@ instance_count: number of intances to use
+     * param@ region: the (default) aws region where the tests are run.
+     * param@ addl_args: additional arguments passed to test_orchestrator.py
+     * return@: the test stage.
+     */
+    return {
+        stage("${stage_name}") {
+            lock(label: lock_label, quantity: instance_count) {
+                this.run_test_orchestrator_once(stage_name, build_tag, os, instance_type, instance_count, region, addl_args)
+            }
+        }
+    }
+}
+
+pipeline {
+    agent {
+        ecs {
+            inheritFrom 'fargate-large'
+        }
+    }
+    options {
+        buildDiscarder(logRotator(daysToKeepStr: "90"))
+        timeout(time: 10, unit: 'HOURS')
+        skipDefaultCheckout()
+    }
+    stages {
+        // Cleanup workspace before job start.
+        stage("Clean up workspace") {
+            steps{
+                deleteDir()
+            }
+        }
+        stage("Checkout SCM repo") {
+            steps {
+                checkout scm
+            }
+        }
+        stage("Check for relevant changes") {
+            steps {
+                script {
+                    check_for_relevant_changes()
+                }
+            }
+        }
+        stage("Download and extract PortaFiducia") {
+            when { not { environment name: 'SKIP_TESTS', value: 'true' } }
+            steps {
+                script {
+                    download_and_extract_portafiducia(portafiducia_path)
+                }
+            }
+        }
+        stage("Install PortaFiducia") {
+            when { not { environment name: 'SKIP_TESTS', value: 'true' } }
+            steps {
+                script {
+                    install_porta_fiducia()
+                }
+
+            }
+        }
+        stage("Install Testing suites") {
+            when { not { environment name: 'SKIP_TESTS', value: 'true' } }
+            steps {
+                script {
+                    download_all_testing_packages()
+                }
+            }
+        }
+        stage("Test EFA provider") {
+            when { not { environment name: 'SKIP_TESTS', value: 'true' } }
+            steps {
+                script {
+                    def stages = [:]
+                    def timeout = "--timeout 90"
+                    def test_suite_pkg = "--test-suite-package subspace_nightly_tests --owner subspace"
+                    def generic_pf = "--cluster-type manual_cluster --test-target libfabric --test-type pr --test-libfabric-pr $env.CHANGE_ID ${test_suite_pkg}"
+                    def pr_ci_tests = "--test-list test_pr_ci_fabtests test_run_efa_unit_tests"
+                    def pr_ci_tests_hpc = "--test-list test_pr_ci_fabtests test_pr_ci_imb test_run_efa_unit_tests"
+
+                    def efa_provider = "--test-libfabric-provider efa"
+                    def shm_provider = "--test-libfabric-provider shm --enable-efa false"
+                    def sm2_provider = "--test-libfabric-provider sm2 --enable-efa false"
+                    def tcp_provider = "--test-libfabric-provider tcp --enable-efa false"
+                    def sockets_provider = "--test-libfabric-provider sockets --enable-efa false"
+
+                    def addl_args_efa = "${timeout} ${generic_pf} ${efa_provider} ${pr_ci_tests}"
+                    def addl_args_efa_hpc = "${timeout} ${generic_pf} ${efa_provider} ${pr_ci_tests_hpc}"
+                    def addl_args_shm = "${timeout} ${generic_pf} ${shm_provider} ${pr_ci_tests}"
+                    def addl_args_sm2 = "${timeout} ${generic_pf} ${sm2_provider} ${pr_ci_tests}"
+                    def addl_args_tcp = "${timeout} ${generic_pf} ${tcp_provider} ${pr_ci_tests}"
+                    def addl_args_sockets = "${timeout} ${generic_pf} ${sockets_provider} ${pr_ci_tests}"
+
+                    // Use lockable resources to limit the number of jobs that can get executed in parallel
+                    def hpc7g16x_lock_label = "hpc7g16x"
+                    def hpc8a96x_lock_label = "hpc8a96x"
+                    def c7g16x_lock_label   = "c7g16x"
+                    def c7gn16x_lock_label  = "c7gn16x"
+                    def c8gn16x_lock_label  = "c8gn16x"
+                    def hpc6a48x_lock_label = "hpc6a48x"
+                    def g4dn16x_lock_label  = "g4dn16x"
+                    def trn248x_lock_label  = "trn248x"
+                    def c5n18x_lock_label   = "c5n18x"
+                    def c7i16x_lock_label   = "c7i16x"
+
+                    // Multi Node Tests - EFA
+                    stages["2_hpc7g_alinux2023_efa"] = get_test_stage_with_lock("2_hpc7g_alinux2023_efa", env.BUILD_TAG, "alinux2023", "hpc7g.16xlarge", 2, "us-east-1", hpc7g16x_lock_label, "--odcr cr-030a16bd086b7b3cf ${addl_args_efa_hpc}")
+                    stages["2_hpc8a_alinux2023_efa"] = get_test_stage_with_lock("2_hpc8a_alinux2023_efa", env.BUILD_TAG, "alinux2023", "hpc8a.96xlarge", 2, "eu-north-1", hpc8a96x_lock_label, "--odcr cr-0c2007d91766881ab ${addl_args_efa_hpc}")
+                    stages["2_c7g_ubuntu2404_efa"]   = get_test_stage_with_lock("2_c7g_ubuntu2404_efa",   env.BUILD_TAG, "ubuntu2404", "c7g.16xlarge",   2, "us-west-2", c7g16x_lock_label,   "--odcr cr-03255c1eeaf9777db ${addl_args_efa}")
+                    stages["2_c7gn_ubuntu2204_efa"]  = get_test_stage_with_lock("2_c7gn_ubuntu2204_efa",  env.BUILD_TAG, "ubuntu2204", "c7gn.16xlarge",  2, "us-west-2", c7gn16x_lock_label,  "--odcr cr-0522a3037fa741630 ${addl_args_efa}")
+                    stages["2_c8gn_alinux2023_efa"]  = get_test_stage_with_lock("2_c8gn_alinux2023_efa",  env.BUILD_TAG, "alinux2023", "c8gn.16xlarge",  2, "us-west-2", c8gn16x_lock_label,  "--odcr cr-0698f5e644dab6868 ${addl_args_efa}")
+                    stages["2_hpc6a_rhel8_efa"]      = get_test_stage_with_lock("2_hpc6a_rhel8_efa",      env.BUILD_TAG, "rhel8",      "hpc6a.48xlarge", 2, "eu-north-1", hpc6a48x_lock_label, "--odcr cr-0adaf0b7d34d510dc ${addl_args_efa_hpc}")
+
+                    // Multi Node Tests - Accelerator EFA
+                    stages["2_g4dn_alinux2023_efa"]  = get_test_stage_with_lock("2_g4dn_alinux2023_efa",  env.BUILD_TAG, "alinux2023", "g4dn.16xlarge",  2, "us-west-2",      g4dn16x_lock_label, "--odcr cr-02a4720192f900b53 ${addl_args_efa}")
+                    stages["2_trn2_alinux2023_efa"]  = get_test_stage_with_lock("2_trn2_alinux2023_efa",  env.BUILD_TAG, "alinux2023", "trn2.48xlarge",  2, "ap-southeast-4", trn248x_lock_label, "--odcr cr-0ea39f1e125501d50 ${addl_args_efa}")
+
+                    // Single Node Windows Test
+                    stages["EFA_Windows_Test"] = get_single_node_windows_test_stage_with_lock("EFA_Windows_Test", c5n18x_lock_label)
+
+                    // Multi Node Tests - Other Providers
+                    stages["2_c7i_alinux2023_tcp"]      = get_test_stage_with_lock("2_c7i_alinux2023_tcp",      env.BUILD_TAG, "alinux2023", "c7i.16xlarge", 2, "us-west-2", c7i16x_lock_label, "--odcr cr-02f365311e1143b20 ${addl_args_tcp}")
+                    stages["2_c7i_ubuntu2204_sockets"]  = get_test_stage_with_lock("2_c7i_ubuntu2204_sockets",  env.BUILD_TAG, "ubuntu2204", "c7i.16xlarge", 2, "us-west-2", c7i16x_lock_label, "--odcr cr-02f365311e1143b20 ${addl_args_sockets}")
+
+                    // Single Node Tests - SM2 / SHM
+                    stages["1_g4dn_alinux2023_sm2"]              = get_test_stage_with_lock("1_g4dn_alinux2023_sm2",              env.BUILD_TAG, "alinux2023", "g4dn.16xlarge", 1, "us-west-2", g4dn16x_lock_label, "--odcr cr-02a4720192f900b53 ${addl_args_sm2}")
+                    stages["1_g4dn_ubuntu2404_shm"]              = get_test_stage_with_lock("1_g4dn_ubuntu2404_shm",              env.BUILD_TAG, "ubuntu2404", "g4dn.16xlarge", 1, "us-west-2", g4dn16x_lock_label, "--odcr cr-02a4720192f900b53 ${addl_args_shm}")
+                    stages["1_g4dn_ubuntu2404_shm_disable-cma"]  = get_test_stage_with_lock("1_g4dn_ubuntu2404_shm_disable-cma",  env.BUILD_TAG, "ubuntu2404", "g4dn.16xlarge", 1, "us-west-2", g4dn16x_lock_label, "--odcr cr-02a4720192f900b53 ${addl_args_shm} --enable-cma false")
+
+                    parallel stages
+                }
+            }
+        }
+        stage('check build_ok') {
+            steps {
+                script {
+                    if (build_ok) {
+                        currentBuild.result = "SUCCESS"
+                    }
+                    else {
+                        currentBuild.result = "FAILURE"
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                post_build_actions()
+            }
+        }
+        cleanup {
+            deleteDir()
+        }
+    }
+}
