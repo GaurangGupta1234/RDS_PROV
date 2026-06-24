@@ -1,0 +1,29 @@
+if HAVE_RDS
+_rds_files = \
+	prov/rds/src/rds_attr.c		\
+	prov/rds/src/rds_init.c		\
+	prov/rds/src/rds_fabric.c	\
+	prov/rds/src/rds_domain.c	\
+	prov/rds/src/rds_cq.c		\
+	prov/rds/src/rds_mr.c		\
+	prov/rds/src/rds_ep.c		\
+	prov/rds/src/rds_msg.c		\
+	prov/rds/src/rds_rma.c		\
+	prov/rds/src/rds_progress.c	\
+	prov/rds/src/rds.h
+
+if HAVE_RDS_DL
+pkglib_LTLIBRARIES += librds-fi.la
+librds_fi_la_SOURCES = $(_rds_files) $(common_srcs)
+librds_fi_la_LIBADD = $(linkback)
+librds_fi_la_LDFLAGS = -module -avoid-version -shared -export-dynamic
+librds_fi_la_DEPENDENCIES = $(linkback)
+else !HAVE_RDS_DL
+src_libfabric_la_SOURCES += $(_rds_files)
+endif !HAVE_RDS_DL
+
+prov_install_man_pages += man/man7/fi_rds.7
+
+endif HAVE_RDS
+
+prov_dist_man_pages += man/man7/fi_rds.7

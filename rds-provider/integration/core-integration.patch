@@ -1,0 +1,58 @@
+diff --git a/Makefile.am b/Makefile.am
+index 58a6059..c3d14ed 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -482,6 +482,7 @@ EXTRA_DIST=
+ 
+ include prov/sockets/Makefile.include
+ include prov/udp/Makefile.include
++include prov/rds/Makefile.include
+ include prov/verbs/Makefile.include
+ include prov/efa/Makefile.include
+ include prov/usnic/Makefile.include
+diff --git a/configure.ac b/configure.ac
+index 7e2c9dd..68a17cb 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1171,6 +1171,7 @@ dnl The usnic provider must be setup after the verbs provider.  See
+ dnl prov/usnic/configure.m4 for details.
+ FI_PROVIDER_SETUP([usnic])
+ FI_PROVIDER_SETUP([udp])
++FI_PROVIDER_SETUP([rds])
+ FI_PROVIDER_SETUP([tcp])
+ FI_PROVIDER_SETUP([rxm])
+ FI_PROVIDER_SETUP([mrail])
+diff --git a/include/ofi_prov.h b/include/ofi_prov.h
+index ac29212..410ec19 100644
+--- a/include/ofi_prov.h
++++ b/include/ofi_prov.h
+@@ -145,6 +145,17 @@ UDP_INI ;
+ #  define UDP_INIT NULL
+ #endif
+ 
++#if (HAVE_RDS) && (HAVE_RDS_DL)
++#  define RDS_INI FI_EXT_INI
++#  define RDS_INIT NULL
++#elif (HAVE_RDS)
++#  define RDS_INI INI_SIG(fi_rds_ini)
++#  define RDS_INIT fi_rds_ini()
++RDS_INI ;
++#else
++#  define RDS_INIT NULL
++#endif
++
+ #if (HAVE_TCP) && (HAVE_TCP_DL)
+ #  define TCP_INI FI_EXT_INI
+ #  define TCP_INIT NULL
+diff --git a/src/fabric.c b/src/fabric.c
+index 754bc69..5ad8284 100644
+--- a/src/fabric.c
++++ b/src/fabric.c
+@@ -992,6 +992,7 @@ void fi_ini(void)
+ 	ofi_register_provider(OPX_INIT, NULL);
+ 	ofi_register_provider(UCX_INIT, NULL);
+ 	ofi_register_provider(UDP_INIT, NULL);
++	ofi_register_provider(RDS_INIT, NULL);
+ 	ofi_register_provider(SOCKETS_INIT, NULL);
+ 	ofi_register_provider(TCP_INIT, NULL);
+ 
