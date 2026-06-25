@@ -69,7 +69,12 @@ static int rds_ep_getopt(fid_t fid, int level, int optname, void *optval,
 static int rds_ep_setopt(fid_t fid, int level, int optname, const void *optval,
 			 size_t optlen)
 {
-	return -FI_ENOPROTOOPT;
+	/*
+	 * Intel MPI calls fi_setopt during init (e.g. FI_OPT_MIN_MULTI_RECV,
+	 * FI_OPT_CUDA_API_PERMITTED).  We accept silently: none of these change
+	 * the RDS data path, and returning -FI_ENOPROTOOPT aborts MPI_Init.
+	 */
+	return 0;
 }
 
 static ssize_t rds_ep_cancel(fid_t fid, void *context)
@@ -110,6 +115,30 @@ static ssize_t rds_ep_cancel(fid_t fid, void *context)
 	ofi_genlock_unlock(&ep->util_ep.lock);
 	return -FI_ENOENT;
 }
+
+/*
+ * Stub atomic ops.  We advertise FI_ATOMICS so Intel MPI's getinfo accepts the
+ * provider, but atomics are not implemented (run with
+ * MPIR_CVAR_CH4_OFI_ENABLE_ATOMICS=0).  Pointing ep->atomic at no-op stubs that
+ * return -FI_ENOSYS is safer than leaving it NULL: a stray fi_atomic gets a
+ * clean error instead of a segfault, and fi_query_atomic reports unsupported.
+ */
+static struct fi_ops_atomic rds_atomic_ops = {
+	.size		= sizeof(struct fi_ops_atomic),
+	.write		= fi_no_atomic_write,
+	.writev		= fi_no_atomic_writev,
+	.writemsg	= fi_no_atomic_writemsg,
+	.inject		= fi_no_atomic_inject,
+	.readwrite	= fi_no_atomic_readwrite,
+	.readwritev	= fi_no_atomic_readwritev,
+	.readwritemsg	= fi_no_atomic_readwritemsg,
+	.compwrite	= fi_no_atomic_compwrite,
+	.compwritev	= fi_no_atomic_compwritev,
+	.compwritemsg	= fi_no_atomic_compwritemsg,
+	.writevalid	= fi_no_atomic_writevalid,
+	.readwritevalid	= fi_no_atomic_readwritevalid,
+	.compwritevalid	= fi_no_atomic_compwritevalid,
+};
 
 static struct fi_ops_ep rds_ep_ops = {
 	.size		= sizeof(struct fi_ops_ep),
@@ -193,9 +222,18 @@ static void rds_ep_flush_lists(struct rds_ep *ep)
 	dlist_foreach_safe(&ep->pending, item, tmp) {
 		pend = container_of(item, struct rds_pending, entry);
 		dlist_remove(&pend->entry);
-		for (i = 0; i < pend->mr_cnt; i++)
-			rds_mr_put(pend->mrs[i]);
-		free(pend->mrs);
+		if (pend->cmrs) {
+			struct rds_domain *d = container_of(ep->util_ep.domain,
+						struct rds_domain, util_domain);
+			for (i = 0; i < pend->mr_cnt; i++)
+				rds_reg_cache_put(d, pend->cmrs[i]);
+			free(pend->cmrs);
+		} else if (pend->mrs) {
+			for (i = 0; i < pend->mr_cnt; i++)
+				rds_mr_put(pend->mrs[i]);
+			free(pend->mrs);
+		}
+		free(pend->bounce);
 		free(pend);
 	}
 }
@@ -216,6 +254,7 @@ static int rds_ep_close(struct fid *fid)
 	if (domain->reg_ep == ep)
 		domain->reg_ep = NULL;
 
+	rds_ep_ring_cleanup(ep);
 	rds_ep_flush_lists(ep);
 
 	if (ep->sock >= 0)
@@ -299,6 +338,7 @@ int rds_endpoint(struct fid_domain *domain, struct fi_info *info,
 	dlist_init(&ep->rx_unexp_msg);
 	dlist_init(&ep->rx_unexp_tag);
 	dlist_init(&ep->pending);
+	rds_ep_ring_init(ep);
 
 	ret = ofi_endpoint_init(domain, &rds_util_prov, info, &ep->util_ep,
 				context, rds_ep_progress);
@@ -335,6 +375,7 @@ int rds_endpoint(struct fid_domain *domain, struct fi_info *info,
 	(*ep_fid)->msg = &rds_msg_ops;
 	(*ep_fid)->tagged = &rds_tagged_ops;
 	(*ep_fid)->rma = &rds_rma_ops;
+	(*ep_fid)->atomic = &rds_atomic_ops;
 	return 0;
 
 err4:

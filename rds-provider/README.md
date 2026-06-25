@@ -1,90 +1,68 @@
-# libfabric RDS provider (zero-copy RDMA) — deliverable
+# libfabric RDS provider (zero-copy RDMA) — v2
 
-A native libfabric provider that runs `FI_EP_RDM` (message, tagged, and RMA)
-over the Linux kernel **RDS** transport on RoCE v2, using the **RDS RDMA cookie**
-mechanism for true **zero-copy** bulk transfer — the same path that gave
-`rds_rdma_v2.c` ~14 µs small-message and ~212 µs 1 MB RTT. Goal: run Intel MPI
-2021 collectives (alltoall, allgather, …) at RDS-RDMA performance.
+A native `FI_EP_RDM` libfabric provider over the Linux kernel **RDS** transport
+on RoCE v2, for Intel MPI 2021 collectives. v2 fixes the large-message
+`-ENOMEM` crash and adds a zero-copy RDMA fast path that targets RDS-RDMA-V2
+latency (~14 µs) — at or below TCP, approaching native verbs.
 
-## What's here
+## Start here
+
+- **`docs/OPTIMIZATION_HANDOVER.md`** — what changed in v2, why, how it fixes
+  each bottleneck, the tuning knobs, what to benchmark, and next steps. Read
+  this first.
+- **`docs/ARCHITECTURE.md`** — the three-tier data-path design.
+- **`docs/TUNING_AND_MPI.md`** — build, run, env flags, Intel MPI wiring.
+- **`docs/RDS_KERNEL_CHANGES.md`** — optional `net/rds` patches (proxy QP, MR
+  page cap); the provider runs on a stock kernel.
+
+## The three transfer tiers
+
+| message size | path | property |
+|--------------|------|----------|
+| small (≤ ring slot, opt-in) | RDMA write into peer ring, **receiver polls memory** | lowest latency, beats TCP |
+| medium (≤ `eager_size`) | RDS datagram `sendmsg` | always available, fully ordered |
+| large (> `eager_size`) | RTS + **RDMA READ** into app buffer (MR cached) | zero-copy bulk, matches RXM |
+
+## What v2 fixed
+
+1. **`-ENOMEM` crash** — rendezvous no longer pins pages per message; it uses a
+   bounded, monitor-backed **MR cache** (always on). Large-message bandwidth
+   recovers; `ulimit -l` is no longer exhausted.
+2. **Small-message latency** — opt-in **zero-copy eager RDMA ring**
+   (`FI_RDS_EAGER_RDMA=1`): memory-polled, no `recvmsg` on the fast path. This
+   is the RDS-RDMA-V2 technique generalized to many peers and fed into tag
+   matching.
+
+## Layout
 
 ```
 rds-provider/
-├── README.md                     ← this file
-├── prov/rds/                     ← the provider (drop into <libfabric>/prov/rds)
-│   ├── configure.m4
-│   ├── Makefile.include
-│   └── src/
-│       ├── rds.h                 backbone: structs, wire framing, helpers, RDS ABI
-│       ├── rds_attr.c            capability / attribute tables (fi_info)
-│       ├── rds_init.c            provider registration, fi_getinfo, params
-│       ├── rds_fabric.c          fabric open/close
-│       ├── rds_domain.c          domain open/close, installs MR ops
-│       ├── rds_cq.c              completion queue (util_cq)
-│       ├── rds_mr.c              memory registration → cookie (zero-copy enabler)
-│       ├── rds_ep.c              endpoint, RDS socket, setname/getname, bind
-│       ├── rds_msg.c             tagged/msg path, matching, eager + rendezvous
-│       ├── rds_rma.c             fi_read / fi_write (one-sided zero copy)
-│       └── rds_progress.c        socket drain + RDMA completion reaping
-├── integration/
-│   └── core-integration.patch    ← 4 one-line edits to libfabric build/glue
-└── docs/
-    ├── RDS_PROVIDER_DESIGN.md    full architecture & data-path design
-    ├── RDS_KERNEL_CHANGES.md     net/rds patches (proxy QP, MR cap, …) + what's optional
-    ├── LIBFABRIC_INTEGRATION.md  step-by-step in-tree integration & build
-    └── INTEL_MPI_USAGE.md        Intel MPI 2021 wiring, tuning, collectives
+├── README.md
+├── prov/rds/                       drop into <libfabric>/prov/rds
+│   ├── configure.m4 · Makefile.include
+│   └── src/  rds.h, rds_attr.c, rds_init.c, rds_fabric.c, rds_domain.c,
+│             rds_cq.c, rds_mr.c (MR cache), rds_ep.c, rds_msg.c,
+│             rds_rma.c, rds_eager.c (RDMA ring), rds_progress.c
+├── integration/core-integration.patch   4 one-line libfabric edits
+└── docs/  OPTIMIZATION_HANDOVER.md, ARCHITECTURE.md, TUNING_AND_MPI.md,
+          RDS_KERNEL_CHANGES.md
 ```
 
-## Quick start (on the target Linux RoCE box)
+## Quick run
 
 ```sh
-# 1. drop in + wire up
-cp -r rds-provider/prov/rds  <libfabric>/prov/rds
-cd <libfabric> && git apply <.../integration/core-integration.patch>
+# build (same as v1: drop in prov/rds, apply the patch, configure --enable-rds)
+modprobe rds rds_rdma
 
-# 2. build
-./autogen.sh && ./configure --prefix=/opt/libfabric-rds --enable-rds
-make -j && make install
+# A) crash fix + bandwidth (MR cache, default):
+mpirun ... -genv FI_PROVIDER rds -genv I_MPI_OFI_PROVIDER rds \
+  -genv MPIR_CVAR_CH4_OFI_ENABLE_RMA 0 -genv MPIR_CVAR_CH4_OFI_ENABLE_ATOMICS 0 \
+  IMB-MPI1 Allgather
 
-# 3. load kernel modules + verify
-sudo modprobe rds rds_rdma
-FI_PROVIDER=rds /opt/libfabric-rds/bin/fi_info -p rds
-
-# 4. run Intel MPI over it
-export I_MPI_OFI_LIBRARY_INTERNAL=0 FI_PROVIDER=rds I_MPI_FABRICS=ofi
-export LD_LIBRARY_PATH=/opt/libfabric-rds/lib:$LD_LIBRARY_PATH
-mpirun -n 2 -ppn 1 -hosts vm2,vm3 ./IMB-MPI1 alltoall
+# B) + small-message latency (zero-copy ring):
+mpirun ... (as above) -genv FI_RDS_EAGER_RDMA 1  IMB-MPI1 Allreduce
 ```
 
-## The one-paragraph design
-
-RDS already gives reliable, ordered, message-boundary datagrams **and** 1-sided
-RDMA with cookies, so the provider is a thin shim, not a reliability layer.
-Small messages go **eager** (one `sendmsg` of `[header|payload]`, one kernel
-copy — cheapest for short MPI traffic). Large messages go **rendezvous**: the
-sender registers its source buffer (`RDS_GET_MR` → cookie), ships a tiny RTS,
-and the receiver issues one-sided **RDMA READs straight into the application
-buffer** — zero copy. `fi_read`/`fi_write` map directly to `RDS_CMSG_RDMA_ARGS`.
-Completions come back as `RDS_CMSG_RDMA_STATUS` (via `user_token` +
-`RDS_RDMA_NOTIFY_ME`), reaped in the progress loop. The MR cookie is exported
-verbatim as the libfabric key; MR uses offset (scalable) semantics that match
-`rds_rdma_args.remote_vec.addr` exactly. The 1 MiB RDS limits are worked around
-by chunking large transfers into ≤1 MiB RDMA segments with a single completion.
-
-See **docs/RDS_PROVIDER_DESIGN.md** for the full writeup.
-
-## Important caveats for the integrating agent
-
-- **Authored on Windows without `<linux/rds.h>`, so it was not compiled here.**
-  It targets the same `prov/util` surface as `prov/udp` and was written against
-  current libfabric master APIs. Compile in-tree on the target; the only
-  version-sensitive spots are the kernel UAPI struct fields
-  (`rds_rdma_args.user_token`, `rds_rdma_notify`).
-- **`RDS_GET_MR` needs a socket bound to the RoCE device and (on a stock kernel)
-  a live connection to post the FRMR.** MPI's init barrier pre-connects peers,
-  which covers it; the robust fix is the **proxy QP** patch in
-  `docs/RDS_KERNEL_CHANGES.md` §3 (the item you flagged from the frmr file). No
-  provider change is needed to benefit from it.
-- **App RMA windows > 1 MiB** need the MR page-cap kernel patch
-  (`RDS_KERNEL_CHANGES.md` §2); point-to-point messages of any size already work
-  via segmented rendezvous.
+> Authored without a Linux RDS toolchain (no `<linux/rds.h>` on the dev host), so
+> compile in-tree on the target. Version-sensitive spots: the kernel UAPI fields
+> `rds_rdma_args.user_token` and `rds_rdma_notify`.

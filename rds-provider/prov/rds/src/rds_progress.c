@@ -54,6 +54,9 @@ void rds_ep_progress(struct util_ep *util_ep)
 
 	ofi_genlock_lock(&ep->util_ep.lock);
 
+	/* Fast path first: poll the memory-mapped eager rings (no syscall). */
+	rds_ring_progress(ep);
+
 	while (budget--) {
 		iov.iov_base = ep->rx_buf;
 		iov.iov_len = ep->rx_buf_size;

@@ -51,6 +51,7 @@
 #include <ofi_enosys.h>
 #include <ofi_list.h>
 #include <ofi_mem.h>
+#include <ofi_mr.h>
 #include <ofi_net.h>
 #include <ofi_util.h>
 #include <ofi_atom.h>
@@ -152,6 +153,21 @@
 #define RDS_DEF_EAGER_SIZE	8192
 #define RDS_MAX_EAGER_SIZE	(RDS_KERNEL_SEG_MAX - (int) sizeof(struct rds_hdr))
 
+/*
+ * RDMA eager fast path (opt-in via FI_RDS_EAGER_RDMA=1).
+ *
+ * Per peer we keep a pre-registered receive ring.  Small messages are written
+ * straight into the peer's ring with a one-sided RDMA write and the receiver
+ * detects arrival by polling memory -- no per-message kernel recv, no
+ * interrupt.  This is the path that reaches RDS-RDMA-V2 latency (~14us RTT vs
+ * ~35us for the datagram path) and beats TCP for small messages.  The RDS
+ * datagram path remains the default and the fallback for un-bootstrapped peers
+ * and for the LRU-evicted cold peers.
+ */
+#define RDS_DEF_RING_SLOTS	16	/* slots per peer ring (power of 2) */
+#define RDS_DEF_RING_SLOT_SIZE	1024	/* bytes per slot                   */
+#define RDS_DEF_RING_MAX_PEERS	256	/* LRU cap on rings (bounds pinning)*/
+
 /* Aggregate message ceiling we advertise. We fragment anything above one
  * kernel segment into multiple RDMA-read segments on the rendezvous path. */
 #define RDS_MAX_MSG_SIZE	(256ULL * 1024 * 1024)
@@ -169,6 +185,8 @@ enum rds_op {
 	RDS_OP_EAGER	= 1,	/* header + inline payload, copy-in/out      */
 	RDS_OP_RTS	= 2,	/* rendezvous request; payload = seg array   */
 	RDS_OP_FIN	= 3,	/* rendezvous done; receiver -> sender ack   */
+	RDS_OP_RING_REQ	= 4,	/* eager-ring handshake request (datagram)   */
+	RDS_OP_RING_ACK	= 5,	/* eager-ring handshake reply   (datagram)   */
 };
 
 enum {
@@ -201,6 +219,56 @@ struct rds_rndzv_seg {
 	uint64_t	len;		/* bytes in this segment (<= seg_max)     */
 };
 
+/*
+ * Eager-ring handshake payload (RDS_OP_RING_REQ / RDS_OP_RING_ACK).  Each side
+ * publishes the cookie of its receive ring (where the peer writes data) and of
+ * its credit cell (where the peer writes back how many slots it has consumed).
+ */
+struct rds_ring_info {
+	uint64_t	ring_cookie;	/* peer writes data here          */
+	uint64_t	credit_cookie;	/* peer writes its consumer index here */
+	uint32_t	slots;
+	uint32_t	slot_size;
+};
+
+/*
+ * One eager-ring slot.  Written by the sender with a single RDMA write spanning
+ * the whole slot, so the trailing @gen word is the last byte placed by the HCA
+ * (writes are processed in ascending address order on this hardware -- the same
+ * assumption rds_rdma_v2.c relies on).  The receiver polls @gen: when it equals
+ * the expected generation the entire slot, header included, is present.
+ */
+struct rds_ring_slot {
+	uint32_t	len;		/* payload bytes                  */
+	uint8_t		flags;		/* RDS_HF_*                       */
+	uint8_t		resv[3];
+	uint64_t	tag;
+	uint64_t	data;
+	uint64_t	ack;		/* piggybacked credit: sender's   */
+					/* consumer index for the reverse */
+					/* direction (avoids a separate   */
+					/* credit RDMA on bidir traffic)  */
+	/* payload occupies [RDS_RING_HDR_SIZE .. slot_size - RDS_RING_GEN_SIZE);
+	 * the last 4 bytes of every slot are the generation stamp. */
+};
+
+#define RDS_RING_HDR_SIZE	((int) sizeof(struct rds_ring_slot))
+#define RDS_RING_GEN_SIZE	((int) sizeof(uint32_t))
+
+static inline void *rds_slot_payload(void *slot)
+{
+	return (char *) slot + RDS_RING_HDR_SIZE;
+}
+static inline volatile uint32_t *rds_slot_gen(void *slot, uint32_t slot_size)
+{
+	return (volatile uint32_t *) ((char *) slot + slot_size -
+				      RDS_RING_GEN_SIZE);
+}
+static inline uint32_t rds_ring_payload_max(uint32_t slot_size)
+{
+	return slot_size - RDS_RING_HDR_SIZE - RDS_RING_GEN_SIZE;
+}
+
 
 /* ------------------------------------------------------------------ */
 /* Provider objects						      */
@@ -211,6 +279,10 @@ extern struct util_prov rds_util_prov;
 extern struct fi_info rds_info;
 
 extern size_t rds_eager_size;		/* resolved at init from the param */
+extern int rds_eager_rdma;		/* FI_RDS_EAGER_RDMA (default off)  */
+extern size_t rds_ring_slots;		/* FI_RDS_RING_SLOTS               */
+extern size_t rds_ring_slot_size;	/* FI_RDS_RING_SLOT_SIZE           */
+extern size_t rds_ring_max_peers;	/* FI_RDS_RING_MAX_PEERS           */
 
 int rds_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
 	       void *context);
@@ -256,6 +328,22 @@ struct rds_domain {
 	 * regardless of which endpoint later issues the RDMA op.
 	 */
 	struct rds_ep		*reg_ep;
+
+	/*
+	 * Registration cache for rendezvous source buffers.  Without it the
+	 * provider called RDS_GET_MR on every large send, which pinned pages
+	 * per message and exhausted ulimit -l (the -ENOMEM crash).  The cache
+	 * registers each buffer once and reuses the cookie; a memory monitor
+	 * invalidates entries if the application frees/remaps the pages.
+	 */
+	struct ofi_mr_cache	mr_cache;
+	int			cache_enabled;
+};
+
+/* Per-entry payload stored inside an ofi_mr_cache entry. */
+struct rds_cached_mr {
+	rds_rdma_cookie_t	cookie;
+	uint32_t		offset;
 };
 
 /* RDS cookie packing (kernel-internal layout, stable UAPI behaviour). */
@@ -332,12 +420,57 @@ struct rds_pending {
 	uint32_t		seg_remaining;	/* RX: reads still outstanding */
 	uint32_t		seg_total;
 	union ofi_sock_ip	peer;		/* RX: where to send FIN       */
-	struct rds_mr		**mrs;		/* TX: source MRs to release   */
+	struct rds_mr		**mrs;		/* TX: uncached source MRs     */
+	struct ofi_mr_entry	**cmrs;		/* TX: cached source MR entries */
 	uint32_t		mr_cnt;
 
 	uint64_t		peer_id;	/* RX: sender's id to echo in FIN */
 	void			*bounce;	/* RMA inject temp buffer      */
 	uint8_t			no_comp;	/* suppress the CQ entry       */
+};
+
+
+/* ------------------------------------------------------------------ */
+/* Eager-ring peer state					      */
+/* ------------------------------------------------------------------ */
+
+enum rds_peer_state {
+	RDS_PEER_NONE = 0,	/* no ring; use datagram path        */
+	RDS_PEER_CONNECTING,	/* RING_REQ sent, awaiting RING_ACK  */
+	RDS_PEER_READY,		/* ring usable both directions       */
+};
+
+#define RDS_PEER_HASH_SIZE	1024
+
+struct rds_peer {
+	struct dlist_entry	bucket;		/* hash chain               */
+	struct dlist_entry	lru;		/* LRU across all peers     */
+	fi_addr_t		addr;
+	union ofi_sock_ip	sa;
+	enum rds_peer_state	state;
+
+	/* Local receive ring: the peer RDMA-writes data here; we poll it. */
+	char			*rx_ring;
+	struct rds_mr		*rx_ring_mr;
+	uint64_t		rx_head;	/* next slot to consume     */
+	uint64_t		rx_credit_sent;	/* last rx_head pushed back  */
+
+	/* Local credit cell: the peer RDMA-writes its consumer index here so
+	 * we learn how much of what we sent has been drained (our tx_tail). */
+	volatile uint64_t	*credit_cell;
+	struct rds_mr		*credit_mr;
+
+	/* Remote targets learned from the handshake. */
+	rds_rdma_cookie_t	rem_ring_cookie;
+	rds_rdma_cookie_t	rem_credit_cookie;
+	uint32_t		rem_slots;
+	uint32_t		rem_slot_size;
+
+	/* Producer state (writes into the peer's ring). */
+	uint64_t		tx_head;	/* next slot to produce      */
+	uint64_t		tx_tail;	/* peer-consumed (from credit/ack) */
+	char			*tx_stage;	/* local staging ring (unreg) */
+	uint64_t		credit_tx;	/* outgoing credit source (8B) */
 };
 
 
@@ -366,6 +499,16 @@ struct rds_ep {
 	void			*cmsg_buf;	/* control buffer for recvmsg */
 	size_t			cmsg_size;
 
+	/* Eager RDMA ring fast path (opt-in). */
+	int			eager_rdma;	/* FI_RDS_EAGER_RDMA          */
+	uint32_t		ring_slots;
+	uint32_t		ring_slot_size;
+	uint32_t		ring_max_peers;
+	uint32_t		ring_payload;	/* usable bytes per slot      */
+	struct dlist_entry	peer_hash[RDS_PEER_HASH_SIZE];
+	struct dlist_entry	peer_lru;
+	uint32_t		peer_cnt;
+
 	ofi_atomic32_t		ref;
 };
 
@@ -380,6 +523,35 @@ void rds_ep_progress(struct util_ep *util_ep);
 struct rds_mr *rds_reg_internal(struct rds_ep *ep, const void *buf, size_t len,
 				uint64_t access);
 void rds_mr_put(struct rds_mr *mr);
+
+/* Registration cache for rendezvous source buffers (rds_mr.c). */
+int rds_mr_cache_open(struct rds_domain *domain);
+void rds_mr_cache_close(struct rds_domain *domain);
+/* Look up / register @buf,@len in the cache; returns the cookie and the entry
+ * (whose ref must be dropped with rds_reg_cache_put when the op completes). */
+int rds_reg_cache_get(struct rds_ep *ep, const void *buf, size_t len,
+		      rds_rdma_cookie_t *cookie, struct ofi_mr_entry **entry);
+void rds_reg_cache_put(struct rds_domain *domain, struct ofi_mr_entry *entry);
+
+/* Eager RDMA ring fast path (rds_eager.c). */
+void rds_ep_ring_init(struct rds_ep *ep);
+void rds_ep_ring_cleanup(struct rds_ep *ep);
+/* Try to send @iov as a ring write. Returns 0 on success, -FI_EAGAIN if the
+ * peer ring is not ready / full (caller should fall back to the datagram
+ * eager path). */
+ssize_t rds_ring_send(struct rds_ep *ep, const struct iovec *iov,
+		      size_t iov_count, fi_addr_t dest, uint64_t tag,
+		      uint64_t data, void *context, uint64_t flags, int tagged,
+		      int gen_comp);
+/* Poll every ready peer ring for arrived slots (called from progress). */
+void rds_ring_progress(struct rds_ep *ep);
+/* Handle a RING_REQ / RING_ACK control datagram. */
+void rds_ring_handle_ctrl(struct rds_ep *ep, struct rds_hdr *hdr, void *payload,
+			  size_t plen, const union ofi_sock_ip *src,
+			  fi_addr_t src_fi);
+/* Deliver a payload that arrived via the ring into the matching engine. */
+void rds_ring_deliver(struct rds_ep *ep, struct rds_peer *peer,
+		      struct rds_ring_slot *slot, void *payload);
 
 ssize_t rds_post_recv(struct rds_ep *ep, const struct iovec *iov,
 		      size_t iov_count, fi_addr_t addr, uint64_t tag,
@@ -400,7 +572,7 @@ ssize_t rds_generic_send(struct rds_ep *ep, const struct iovec *iov,
 ssize_t rds_post_rdma(struct rds_ep *ep, const void *dest_addr,
 		      size_t dest_addrlen, rds_rdma_cookie_t cookie,
 		      uint64_t remote_off, const struct iovec *local_iov,
-		      size_t iov_cnt, int is_write, uint64_t token);
+		      size_t iov_cnt, int is_write, int notify, uint64_t token);
 
 /* Inbound dispatch, called from the progress engine. */
 void rds_handle_inbound(struct rds_ep *ep, struct rds_hdr *hdr, void *payload,

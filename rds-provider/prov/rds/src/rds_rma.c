@@ -16,7 +16,7 @@
 ssize_t rds_post_rdma(struct rds_ep *ep, const void *dest_addr,
 		      size_t dest_addrlen, rds_rdma_cookie_t cookie,
 		      uint64_t remote_off, const struct iovec *local_iov,
-		      size_t iov_cnt, int is_write, uint64_t token)
+		      size_t iov_cnt, int is_write, int notify, uint64_t token)
 {
 	struct msghdr msg;
 	struct cmsghdr *cmsg;
@@ -41,8 +41,12 @@ ssize_t rds_post_rdma(struct rds_ep *ep, const void *dest_addr,
 	args.remote_vec.bytes = total;
 	args.local_vec_addr = (uint64_t) (uintptr_t) liov;
 	args.nr_local = iov_cnt;
-	args.flags = RDS_RDMA_NOTIFY_ME | (is_write ? RDS_RDMA_READWRITE : 0);
-	args.user_token = token;
+	/* notify==0: fire-and-forget (eager ring writes). RDS is reliable, so
+	 * no completion is needed for correctness; the receiver detects arrival
+	 * by polling memory. */
+	args.flags = (is_write ? RDS_RDMA_READWRITE : 0) |
+		     (notify ? RDS_RDMA_NOTIFY_ME : 0);
+	args.user_token = notify ? token : 0;
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_name = (void *) dest_addr;
@@ -120,7 +124,7 @@ static ssize_t rds_rma_common(struct rds_ep *ep, const struct iovec *iov,
 		}
 		ret = rds_post_rdma(ep, dest, addrlen, (rds_rdma_cookie_t) key,
 				    remote_off + off, liov, lcnt, is_write,
-				    pend->id);
+				    1 /* notify */, pend->id);
 		if (ret)
 			break;
 		pend->seg_remaining++;
@@ -264,8 +268,8 @@ static ssize_t rds_inject_write(struct fid_ep *ep_fid, const void *buf,
 	iov.iov_base = bounce;
 	iov.iov_len = len;
 	ret = rds_post_rdma(ep, dest, ep->util_ep.av->addrlen,
-			    (rds_rdma_cookie_t) key, addr, &iov, 1, 1,
-			    pend->id);
+			    (rds_rdma_cookie_t) key, addr, &iov, 1, 1 /*write*/,
+			    1 /* notify */, pend->id);
 	if (ret) {
 		dlist_remove(&pend->entry);
 		free(pend);

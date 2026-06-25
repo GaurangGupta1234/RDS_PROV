@@ -110,20 +110,37 @@ struct rds_pending *rds_pending_find(struct rds_ep *ep, uint64_t id)
 	return NULL;
 }
 
+/* Release the source registrations a rendezvous-tx held (cached or not). */
+static void rds_pending_release_mrs(struct rds_ep *ep, struct rds_pending *pend)
+{
+	struct rds_domain *domain;
+	uint32_t i;
+
+	if (pend->cmrs) {
+		domain = container_of(ep->util_ep.domain, struct rds_domain,
+				      util_domain);
+		for (i = 0; i < pend->mr_cnt; i++)
+			rds_reg_cache_put(domain, pend->cmrs[i]);
+		free(pend->cmrs);
+		pend->cmrs = NULL;
+	} else if (pend->mrs) {
+		for (i = 0; i < pend->mr_cnt; i++)
+			rds_mr_put(pend->mrs[i]);
+		free(pend->mrs);
+		pend->mrs = NULL;
+	}
+}
+
 /* Generic terminal completion: used by RMA ops and by rendezvous-tx on FIN. */
 void rds_pending_complete(struct rds_ep *ep, struct rds_pending *pend)
 {
-	uint32_t i;
-
 	if (pend->type == RDS_PEND_RNDZV_TX || pend->type == RDS_PEND_RMA) {
 		if (!pend->no_comp)
 			rds_cq_write_tx(ep, pend->context, pend->flags,
 					pend->len, pend->error);
 	}
 
-	for (i = 0; i < pend->mr_cnt; i++)
-		rds_mr_put(pend->mrs[i]);
-	free(pend->mrs);
+	rds_pending_release_mrs(ep, pend);
 	free(pend->bounce);
 	dlist_remove(&pend->entry);
 	free(pend);
@@ -335,7 +352,7 @@ static void rds_start_rndzv_read(struct rds_ep *ep, struct rds_rx_entry *rx,
 					(const struct sockaddr *) peer),
 				    (rds_rdma_cookie_t) segs[i].cookie,
 				    segs[i].off, liov, lcnt, 0 /* read */,
-				    pend->id);
+				    1 /* notify */, pend->id);
 		if (ret) {
 			if (!pend->error)
 				pend->error = -ret;
@@ -412,6 +429,11 @@ void rds_handle_inbound(struct rds_ep *ep, struct rds_hdr *hdr, void *payload,
 		struct rds_pending *pend = rds_pending_find(ep, hdr->id);
 		if (pend && pend->type == RDS_PEND_RNDZV_TX)
 			rds_pending_complete(ep, pend);
+		return;
+	}
+
+	if (hdr->op == RDS_OP_RING_REQ || hdr->op == RDS_OP_RING_ACK) {
+		rds_ring_handle_ctrl(ep, hdr, payload, payload_len, src, src_fi);
 		return;
 	}
 
@@ -590,15 +612,21 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 			      void *context, uint64_t flags, int tagged,
 			      int gen_comp)
 {
+	struct rds_domain *domain;
 	struct rds_pending *pend;
 	struct rds_rndzv_seg *segs;
-	struct rds_mr **mrs;
+	struct rds_mr **mrs = NULL;
+	struct ofi_mr_entry **cmrs = NULL;
 	struct rds_hdr hdr;
 	struct iovec siov[2];
 	struct msghdr msg;
 	size_t total, nseg = 0, i, k;
+	int cached;
 	ssize_t ret;
 
+	domain = container_of(ep->util_ep.domain, struct rds_domain,
+			      util_domain);
+	cached = domain->cache_enabled;
 	total = ofi_total_iov_len(iov, iov_count);
 
 	/* One segment per <= 1 MiB chunk of every source iov (the RDS MR limit
@@ -614,15 +642,23 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 		return -FI_EMSGSIZE;
 	}
 
-	mrs = calloc(nseg, sizeof(*mrs));
+	if (cached)
+		cmrs = calloc(nseg, sizeof(*cmrs));
+	else
+		mrs = calloc(nseg, sizeof(*mrs));
 	segs = calloc(nseg, sizeof(*segs));
-	if (!mrs || !segs) {
+	if ((cached ? (void *) cmrs : (void *) mrs) == NULL || !segs) {
 		free(mrs);
+		free(cmrs);
 		free(segs);
 		return -FI_ENOMEM;
 	}
 
-	/* Register each source chunk and describe it. */
+	/*
+	 * Register (or cache-hit) each source chunk and describe it.  The cache
+	 * keeps the registration alive across messages, so repeated sends from
+	 * the same buffer (the common MPI case) avoid RDS_GET_MR entirely.
+	 */
 	k = 0;
 	for (i = 0; i < iov_count; i++) {
 		char *base = iov[i].iov_base;
@@ -630,15 +666,24 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 
 		while (left) {
 			size_t clen = MIN(left, (size_t) RDS_KERNEL_SEG_MAX);
-			struct rds_mr *mr;
+			rds_rdma_cookie_t cookie;
 
-			mr = rds_reg_internal(ep, base, clen, FI_REMOTE_READ);
-			if (!mr) {
-				ret = -FI_ENOMEM;
-				goto err_unreg;
+			if (cached) {
+				ret = rds_reg_cache_get(ep, base, clen, &cookie,
+							&cmrs[k]);
+				if (ret)
+					goto err_unreg;
+			} else {
+				struct rds_mr *mr = rds_reg_internal(ep, base,
+							clen, FI_REMOTE_READ);
+				if (!mr) {
+					ret = -FI_ENOMEM;
+					goto err_unreg;
+				}
+				mrs[k] = mr;
+				cookie = mr->cookie;
 			}
-			mrs[k] = mr;
-			segs[k].cookie = (uint64_t) mr->cookie;
+			segs[k].cookie = (uint64_t) cookie;
 			segs[k].off = 0;
 			segs[k].len = clen;
 			k++;
@@ -655,6 +700,7 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 	}
 	pend->len = total;
 	pend->mrs = mrs;
+	pend->cmrs = cmrs;
 	pend->mr_cnt = nseg;
 	pend->no_comp = !gen_comp;
 
@@ -690,13 +736,18 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 	}
 
 	free(segs);	/* the kernel copied them during sendmsg */
-	/* mrs ownership transferred to pend; freed on FIN. */
+	/* mr ownership transferred to pend; released on FIN. */
 	return 0;
 
 err_unreg:
-	for (i = 0; i < k; i++)
-		rds_mr_put(mrs[i]);
+	for (i = 0; i < k; i++) {
+		if (cached)
+			rds_reg_cache_put(domain, cmrs[i]);
+		else
+			rds_mr_put(mrs[i]);
+	}
 	free(mrs);
+	free(cmrs);
 	free(segs);
 	return ret;
 }
@@ -726,12 +777,24 @@ ssize_t rds_generic_send(struct rds_ep *ep, const struct iovec *iov,
 	gen_comp = !!((ep->util_ep.tx_op_flags | flags) & FI_COMPLETION);
 
 	ofi_genlock_lock(&ep->util_ep.lock);
+
+	/* Fast path: zero-copy RDMA ring write (opt-in). Falls through to the
+	 * datagram path on -FI_EAGAIN (handshake pending, ring full, oversize,
+	 * or peer past the resident cap). */
+	if (ep->eager_rdma && total <= ep->ring_payload) {
+		ret = rds_ring_send(ep, iov, iov_count, dest_addr, tag, data,
+				    context, flags, tagged, gen_comp);
+		if (ret != -FI_ENOSYS)
+			goto out;	/* 0 (sent) or -FI_EAGAIN (retry) */
+	}
+
 	if (total <= rds_eager_size)
 		ret = rds_send_eager(ep, iov, iov_count, dest, destlen, tag,
 				     data, context, flags, tagged, gen_comp);
 	else
 		ret = rds_send_rndzv(ep, iov, iov_count, dest, destlen, tag,
 				     data, context, flags, tagged, gen_comp);
+out:
 	ofi_genlock_unlock(&ep->util_ep.lock);
 	return ret;
 }
@@ -756,8 +819,16 @@ static ssize_t rds_generic_inject(struct rds_ep *ep, const void *buf,
 	iov.iov_len = len;
 
 	ofi_genlock_lock(&ep->util_ep.lock);
+	/* Inject must share the send channel for ordering; try the ring first. */
+	if (ep->eager_rdma && len <= ep->ring_payload) {
+		ret = rds_ring_send(ep, &iov, 1, dest_addr, tag, 0, NULL, 0,
+				    tagged, 0 /* no completion */);
+		if (ret != -FI_ENOSYS)
+			goto out;
+	}
 	ret = rds_send_eager(ep, &iov, 1, dest, ep->util_ep.av->addrlen, tag,
 			     0, NULL, 0, tagged, 0 /* no completion */);
+out:
 	ofi_genlock_unlock(&ep->util_ep.lock);
 	return ret;
 }

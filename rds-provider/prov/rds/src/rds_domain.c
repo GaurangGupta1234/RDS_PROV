@@ -28,6 +28,7 @@ static int rds_domain_close(fid_t fid)
 
 	domain = container_of(fid, struct rds_domain,
 			      util_domain.domain_fid.fid);
+	rds_mr_cache_close(domain);
 	ret = ofi_domain_close(&domain->util_domain);
 	if (ret)
 		return ret;
@@ -63,6 +64,10 @@ int rds_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 		free(rds_domain);
 		return ret;
 	}
+
+	/* Best-effort: if the cache can't init we fall back to per-message
+	 * registration, so ignore the return code here. */
+	rds_mr_cache_open(rds_domain);
 
 	*domain = &rds_domain->util_domain.domain_fid;
 	(*domain)->fid.ops = &rds_domain_fi_ops;
