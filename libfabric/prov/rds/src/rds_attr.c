@@ -42,7 +42,7 @@ struct fi_tx_attr rds_tx_attr = {
 			  FI_INJECT_COMPLETE,
 	.msg_order	= RDS_MSG_ORDER,
 	.comp_order	= FI_ORDER_NONE,
-	.inject_size	= RDS_DEF_EAGER_SIZE,
+	.inject_size	= RDS_DEF_INJECT_SIZE,
 	.size		= 1024,
 	.iov_limit	= RDS_IOV_LIMIT,
 	.rma_iov_limit	= 1,

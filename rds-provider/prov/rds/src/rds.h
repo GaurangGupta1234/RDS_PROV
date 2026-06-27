@@ -162,9 +162,28 @@
  */
 #define RDS_KERNEL_SEG_MAX	(1024 * 1024)
 
-/* Default eager threshold; <= this many payload bytes ship inline. Overridable
- * via FI_RDS_EAGER_SIZE / the "eager_size" param. */
-#define RDS_DEF_EAGER_SIZE	8192
+/*
+ * Default eager threshold; <= this many payload bytes ship inline (one kernel
+ * copy each way) instead of going zero-copy rendezvous.  Overridable via
+ * FI_RDS_EAGER_SIZE / the "eager_size" param, up to RDS_MAX_EAGER_SIZE (~1 MiB,
+ * the single-datagram limit).
+ *
+ * Set to 64 KiB rather than 8 KiB deliberately.  Measurements on the target
+ * fabric show the datagram eager path is the robust, fast choice well past
+ * 8 KiB (it beats tcp;ofi_rxm by ~3.5x at 32 KiB and scales cleanly to 192 PPN),
+ * whereas the rendezvous RTS/READ/FIN handshake -- with its reverse RDMA reads
+ * funnelled through the single shared per-node-pair QP -- only pays off for
+ * genuinely large transfers and is where dense-collective contention shows up.
+ * Pushing the crossover out keeps the whole common collective range (IMB sweeps
+ * top out at 4 MiB; most traffic is far smaller) on the path that scales.
+ */
+#define RDS_DEF_EAGER_SIZE	65536
+
+/* fi_inject advertised size: keep modest and decoupled from the eager
+ * threshold.  fi_inject must copy and return, so we do not want MPI injecting
+ * 64 KiB synchronously even though the eager path could carry it. */
+#define RDS_DEF_INJECT_SIZE	8192
+
 #define RDS_MAX_EAGER_SIZE	(RDS_KERNEL_SEG_MAX - (int) sizeof(struct rds_hdr))
 
 /*

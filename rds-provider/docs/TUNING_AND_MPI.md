@@ -47,7 +47,7 @@ export MPIR_CVAR_CH4_OFI_ENABLE_RMA=0
 
 | env var | meaning | default |
 |---------|---------|---------|
-| `FI_RDS_EAGER_SIZE` | datagram-eager vs rendezvous threshold (bytes) | 8192 |
+| `FI_RDS_EAGER_SIZE` | datagram-eager vs rendezvous threshold (bytes) | 65536 |
 | `FI_RDS_MR_CACHE` | cache rendezvous source registrations (0/1) | 1 |
 | `FI_RDS_RNDZV_INFLIGHT` | max concurrent rendezvous sends before `-FI_EAGAIN` (flow control) | 256 |
 | `FI_RDS_SNDBUF` | `SO_SNDBUF` bytes on the RDS socket (0 = kernel default) | 0 |
@@ -104,3 +104,9 @@ Targets: Alltoall/Allgather no longer hang at any size; Allreduce latency is fla
   pattern is too dense for `FI_RDS_RING_MAX_PEERS`.
 - **Latency spikes under heavy collectives** → raise `FI_RDS_SNDBUF` (4–16 MiB)
   and/or lower `FI_RDS_RNDZV_INFLIGHT` to throttle the storm sooner.
+- **Dense Alltoall/Allgather hangs when it crosses into Rendezvous** (the
+  deadlock fixed in v3.1, CHANGES_V3.md §6) → the head-of-line fix should clear
+  it. If a residual stall remains on a given fabric, raise `FI_RDS_EAGER_SIZE`
+  toward 1 MiB so the collective range stays on the eager path (which scales to
+  192 PPN); `SO_SNDBUF` will *not* help here — the limit is RDMA work-request
+  slots on the shared per-node-pair QP, not socket bytes.

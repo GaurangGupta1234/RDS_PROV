@@ -248,13 +248,13 @@ static void rds_send_fin(struct rds_ep *ep, const union ofi_sock_ip *peer,
 {
 	ssize_t ret;
 
-	/* If anything is already parked, queue behind it so the socket drains
-	 * strictly in order. */
-	if (!dlist_empty(&ep->deferred)) {
-		rds_defer_fin(ep, peer, id);
-		return;
-	}
-
+	/*
+	 * Try the socket immediately.  Parked ops are per-destination and have
+	 * no ordering relationship to this FIN, so we do NOT queue behind them:
+	 * a FIN to a reachable peer must not wait on an op to a congested one
+	 * (that head-of-line coupling is what deadlocked dense collectives).
+	 * Only a genuine EAGAIN for THIS peer parks the FIN for retry.
+	 */
 	ret = rds_send_fin_raw(ep, peer, id);
 	if (ret == -FI_EAGAIN)
 		rds_defer_fin(ep, peer, id);
@@ -604,24 +604,47 @@ void rds_handle_rdma_notify(struct rds_ep *ep, uint64_t token, int status)
 }
 
 /*
- * Re-issue parked FINs and rendezvous READs in FIFO order.  Called first in
- * every progress pass.  Stops at the first op the socket still rejects with
- * -FI_EAGAIN (the queue is still full) and returns -FI_EAGAIN so the caller can
- * skip the rest of progress cheaply; returns 0 once the queue is empty.
+ * Re-issue parked FINs and rendezvous READs.  Called first in every progress
+ * pass.
+ *
+ * CRITICAL: this must NOT stop at the first op the socket rejects.  Parked ops
+ * target different peers, and the RDS send path is flow-controlled PER
+ * DESTINATION (a congested peer's port back-pressures only sends to it).  An
+ * earlier version stopped at the first -FI_EAGAIN, so one congested peer
+ * head-of-line-blocked the reads/FINs to every other peer.  In a dense
+ * collective that is a cyclic wait -> deadlock: a node can only relieve its
+ * incoming RTS storm by issuing RDMA reads back to the senders, but those reads
+ * sit behind a stuck op and never go out, so the senders' rendezvous never
+ * finalize and their FINs never arrive.  So we walk the WHOLE queue, retry each
+ * op independently, drop the ones that succeed, and keep only the ones that
+ * still EAGAIN for the next pass.  Parked ops have no ordering requirement among
+ * themselves (each FIN/read completes an independent transfer), so reordering is
+ * safe.
+ *
+ * Returns 0 if the queue fully drained, -FI_EAGAIN if anything is still parked.
  */
 int rds_progress_deferred(struct rds_ep *ep)
 {
+	struct dlist_entry *item, *tmp;
 	struct rds_deferred *d;
 	struct rds_pending *pend;
 	ssize_t ret;
+	int blocked = 0;
 
-	while (!dlist_empty(&ep->deferred)) {
-		d = container_of(ep->deferred.next, struct rds_deferred, entry);
+	/*
+	 * dlist_foreach_safe tolerates removing the current node.  A finalize()
+	 * below can append a new FIN at the tail (rds_send_fin defers when the
+	 * queue is non-empty); that node is simply picked up on the next pass.
+	 */
+	dlist_foreach_safe(&ep->deferred, item, tmp) {
+		d = container_of(item, struct rds_deferred, entry);
 
 		if (d->type == RDS_DEFERRED_FIN) {
 			ret = rds_send_fin_raw(ep, &d->peer, d->id);
-			if (ret == -FI_EAGAIN)
-				return -FI_EAGAIN;	/* still full */
+			if (ret == -FI_EAGAIN) {
+				blocked = 1;	/* keep it; try a different peer */
+				continue;
+			}
 			dlist_remove(&d->entry);
 			free(d);
 			continue;
@@ -640,8 +663,10 @@ int rds_progress_deferred(struct rds_ep *ep)
 		ret = rds_post_rdma(ep, &d->peer, d->peerlen, d->cookie,
 				    d->remote_off, d->liov, d->lcnt,
 				    0 /* read */, 1 /* notify */, d->id);
-		if (ret == -FI_EAGAIN)
-			return -FI_EAGAIN;	/* still full; retry next pass */
+		if (ret == -FI_EAGAIN) {
+			blocked = 1;		/* keep it; try a different peer */
+			continue;
+		}
 
 		dlist_remove(&d->entry);
 		free(d);
@@ -655,7 +680,7 @@ int rds_progress_deferred(struct rds_ep *ep)
 		if (pend->seg_remaining == 0 && pend->seg_deferred == 0)
 			rds_rndzv_rx_finalize(ep, pend);
 	}
-	return 0;
+	return blocked ? -FI_EAGAIN : 0;
 }
 
 void rds_ep_flush_deferred(struct rds_ep *ep)

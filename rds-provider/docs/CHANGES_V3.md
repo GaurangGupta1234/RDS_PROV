@@ -1,5 +1,46 @@
 # RDS provider v3 — handover (read this first)
 
+> ## ⚡ v3.1 update — the dense-collective Rendezvous deadlock
+>
+> Your "RDS Rendezvous Deadlock" report (Alltoall/Allgather hang the moment they
+> cross into Rendezvous at ≥16 PPN) gets a **two-part provider-level fix**: a real
+> head-of-line bug is removed, and the default crossover is moved so the proven
+> path carries the common range. Full analysis in **§6**; short version:
+>
+> **Why buffer/inflight tuning couldn't move it.** `FI_RDS_RNDZV_INFLIGHT` is
+> *per rank*, but the RDS connection and its QP are *per node-pair, shared by all
+> PPN ranks*. At 16 PPN that funnels ~16×8 = **128 concurrent rendezvous
+> RDMA-reads through one QP**, whose hardware outstanding-read limit
+> (`max_rd_atomic`, ~16) and send-ring depth are far smaller. The send ring fills
+> and `sendmsg` returns `EAGAIN` **regardless of `SO_SNDBUF`** (that bounds bytes,
+> not RDMA work-request slots). The provider parks those reads/FINs to retry
+> them — and there was the bug.
+>
+> **Bug (fixed): head-of-line blocking in the deferred-op queue.**
+> `rds_progress_deferred` **stopped at the first parked op the socket refused**
+> (`return -FI_EAGAIN`). RDS flow-controls *per destination* and parked ops target
+> *different* peers, so one congested peer stalled the reads/FINs to every other
+> peer. That is the cyclic wait: a node can only drain its incoming RTS storm by
+> issuing RDMA reads back to the senders, but those reads sit behind a stuck op,
+> so the senders' rendezvous never finalize and their FINs never come — everyone
+> spins in `recvmsg`, exactly your `pstack`. **Fix:** walk the *whole* parked
+> queue each pass, retry every op independently, keep only the ones that still
+> `EAGAIN`. Parked ops are mutually order-independent, so this is safe; a node now
+> progresses on every reachable peer regardless of a congested one. (`rds_send_fin`
+> also tries the socket immediately instead of queuing behind unrelated parked
+> ops; the RDMA-completion batch buffer grew 16→64.)
+>
+> **Default change: `FI_RDS_EAGER_SIZE` 8 KiB → 64 KiB.** The HOL fix makes
+> rendezvous *complete*, but pushing 128 reads through one shared QP is still
+> slower than it should be, and your own data shows the **eager path is the better
+> choice well past 8 KiB** (3.5× TCP at 32 KiB, clean to 192 PPN). So the crossover
+> now sits at 64 KiB: the common collective range rides the path that scales, and
+> the failing command (which sets no `FI_RDS_EAGER_SIZE`) now runs its 16 KiB /
+> 32 KiB iterations as eager and completes. Rendezvous still applies above 64 KiB
+> and is now hang-free; raise `FI_RDS_EAGER_SIZE` toward 1 MiB to confine it
+> further. The real fix for >1 MiB without rendezvous (segmented-eager) and the
+> QP-pool direction are laid out in §6.
+
 This is the map for the agent on the H4D VMs. It explains, in order:
 
 1. what state you handed me (the `jetski_v2_golden` patch) and what was broken,
@@ -36,9 +77,10 @@ v3 fixes all three **architecturally**:
    travel the reliable RDS datagram socket.** The FIN is addressed by the
    sockaddr we received the RTS from — no AV reverse-lookup, nothing to fail.
 2. **A deferred-op queue (`ep->deferred`).** Any FIN or rendezvous RDMA READ the
-   socket rejects with `EAGAIN` is parked and re-issued, in FIFO order, from the
-   progress engine — never dropped. A full send queue becomes *back-pressure*,
-   not a lost message. This is the no-hang / no-drop guarantee.
+   socket rejects with `EAGAIN` is parked and re-issued from the progress engine
+   — never dropped. A full send queue becomes *back-pressure*, not a lost
+   message. This is the no-hang / no-drop guarantee. (v3.1: the drain retries
+   **all** parked ops each pass, not just the head — see the callout / §6.)
 3. **Rendezvous flow control:** a per-endpoint cap on in-flight rendezvous sends
    (`FI_RDS_RNDZV_INFLIGHT`, default 256). Past the cap, sends get `-FI_EAGAIN`
    and the application throttles itself instead of flooding the connection.
@@ -69,7 +111,10 @@ additions as one coherent delta. The files I touched:
 | `rds_domain.c` | real `rds_cntr_open` (with a non-NULL progress fn — see §3.6) |
 | `rds_init.c` | new params: `mr_cache`, `rndzv_inflight`, `sndbuf`, `rcvbuf` |
 
-`rds_rma.c` and `rds_attr.c` are unchanged.
+v3.1 additionally touched: `rds_msg.c` (HOL fix in `rds_progress_deferred`,
+inline FIN), `rds_ep.c` (notify buffer 16→64), `rds.h` (`RDS_DEF_EAGER_SIZE`
+8 KiB→64 KiB, new `RDS_DEF_INJECT_SIZE`), `rds_attr.c` (advertise the decoupled
+`inject_size`). `rds_rma.c` is unchanged.
 
 ---
 
@@ -268,3 +313,101 @@ I could not compile or run here (no `<linux/rds.h>` / RDS toolchain on this
 host), so the version-sensitive spots to watch at build time are the kernel UAPI
 structs `rds_get_mr_for_dest_args`, `rds_rdma_args.user_token`, and
 `rds_rdma_notify`. Everything else is plain libfabric `prov/util`.
+
+---
+
+## 6. Deep dive: the dense-collective Rendezvous deadlock (your handoff doc)
+
+You isolated it perfectly — Eager fine at 192 PPN, Rendezvous hangs the instant a
+dense collective uses it, stuck in `recvmsg`, unmoved by `RNDZV_INFLIGHT=8` and
+16 MiB buffers. Here is the full chain and exactly what I changed.
+
+### 6.1 Why it deadlocks (and why it's Rendezvous-only)
+
+Eager is a one-way street: `sendmsg` → the receiver `recvmsg`s and copies out.
+Draining an eager message needs **no reverse send**, so a node can always make
+progress by reading. That is why it scales to 192 PPN.
+
+Rendezvous is not one-way. To retire one incoming RTS the receiver must **send**
+back to the originator — an RDMA READ, then a FIN. "Consume requires send" is the
+classic deadlock shape, and three things make it bite here:
+
+1. **Shared QP.** All PPN ranks on a node share **one** RDS connection / QP to
+   each peer node. `RNDZV_INFLIGHT` caps rendezvous *per rank*, so the per-QP
+   concurrency is `PPN × INFLIGHT` — 128 even at your `INFLIGHT=8`. The QP's
+   `max_rd_atomic` (~16 outstanding reads) and send-ring depth are much smaller,
+   so the RDS send ring fills and `sendmsg`/the RDMA post returns `EAGAIN`.
+   `SO_SNDBUF` is irrelevant — it bounds *bytes in the socket buffer*, not RDMA
+   work-request slots on the QP. (This is the part your "not buffer exhaustion"
+   observation correctly ruled out — it just wasn't the buffer you can tune.)
+2. **The provider parks the EAGAIN'd reads/FINs** (so it never blocks the recv
+   drain — good) **but then drained them with head-of-line blocking** (bad): it
+   stopped at the first parked op the socket refused. One congested peer froze
+   the reads/FINs to all other peers.
+3. **Cyclic wait.** Now node A's reads to B are stuck behind a stuck op, so A
+   never finalizes B's transfers, so A never FINs B, so B's senders stay
+   in-flight and B's queues stay full, so B can't accept A's reads… every node
+   spins in `recvmsg`. Deadlock.
+
+### 6.2 The two fixes
+
+- **Remove the head-of-line block** (`rds_progress_deferred`, `rds_msg.c`). Retry
+  *every* parked op each pass; keep only the ones that still `EAGAIN`. Parked ops
+  are independent across peers and unordered among themselves, so a node now
+  drains reads/FINs to every reachable peer even while one peer's QP is saturated.
+  The QP saturation becomes *slowness that drains*, not a *cycle that wedges*.
+  `rds_send_fin` tries the socket inline (no queuing behind unrelated ops); notify
+  batch buffer 16→64.
+
+- **Move the eager/rendezvous crossover to 64 KiB** (`RDS_DEF_EAGER_SIZE`). Your
+  data already proved eager is the better path far past 8 KiB; this keeps the
+  common collective range on it. Rendezvous (now hang-free) is reserved for the
+  large transfers where zero-copy actually pays for its handshake.
+
+### 6.3 Is rendezvous "wrong, or just slow"? — both, now neither fatal
+
+It was *wrong* in one spot (the HOL drain) and *structurally slow* in another
+(128 reads through one QP). The HOL bug is a true fix. The QP funnel is not a bug
+but a real ceiling: even correct, one QP can't run thousands of concurrent reads
+fast. So for the sizes where rendezvous matters, the throughput is capped by that
+one QP until the architecture changes — which is your QP-pool idea (§6.5).
+
+### 6.4 The robust >1 MiB answer at the provider level: segmented-eager
+
+Eager is capped at one RDS datagram (~1 MiB). For messages larger than that
+*without* rendezvous, the clean provider-level path is **segmented eager**: split
+the message into ≤`eager_size` datagrams and reassemble on the receiver. RDS
+gives reliable, in-order, per-pair delivery, so reassembly is trivial (no
+sequence gaps, no retransmit) — far simpler than rxm's SAR. Sketch:
+
+- new `RDS_OP_EAGER_SEG` carrying `{msg_id, seg_idx, nsegs, total}` in the header;
+- the receiver matches the **first** segment to a posted recv, then streams the
+  remaining segments (same `msg_id`, arriving in order) into that buffer at the
+  running offset; completes on the last;
+- no MR registration, no RDMA, no reverse RTS/READ/FIN — only the eager path that
+  already scales. Loses zero-copy (two kernel copies) but cannot deadlock.
+
+This is the recommended next implementation step if you need robust >1 MiB before
+the QP-pool work. It is **not** in this push (it is a new protocol and I would
+rather land it tested than rushed); ~150 lines, isolated to `rds_msg.c`. Say the
+word and I will add it.
+
+### 6.5 The QP-pool direction (your architectural note, for later)
+
+Spreading a node-pair's traffic across a small pool of QPs (you suggested 4–8)
+directly attacks §6.1.1: it multiplies `max_rd_atomic` and send-ring capacity, so
+rendezvous reads stop funnelling through one bottleneck. This needs the RDS
+kernel side you said you'll supply later; on the provider side it is mostly
+transparent (the provider already addresses peers by sockaddr — the multiplexing
+is below us). When you send the RDS patches/version, this is where the provider
+hooks in. It does not change any of the v3.1 fixes above; they are prerequisites.
+
+### 6.6 Two scaling notes I noticed while here (not the deadlock)
+
+- `rds_pending_find` / the match queues are **O(n) linear scans**. At a few
+  thousand concurrent rendezvous that is O(n²) per collective step — real CPU
+  overhead at 1536 ranks, though not a hang. Worth hashing the pending list by
+  `id` (a follow-up); flagged so it is on the radar when chasing latency.
+- The recv drain budget is 256 messages/pass; fine because MPI re-enters
+  progress, but if you see throughput plateaus under the heaviest storms it is a
+  cheap knob to raise.

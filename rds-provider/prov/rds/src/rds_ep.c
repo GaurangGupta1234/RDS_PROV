@@ -380,8 +380,11 @@ int rds_endpoint(struct fid_domain *domain, struct fi_info *info,
 		goto err2;
 	}
 
-	/* Control buffer big enough for a batch of RDMA completion notifies. */
-	ep->cmsg_size = CMSG_SPACE(sizeof(struct rds_rdma_notify)) * 16;
+	/* Control buffer big enough for a batch of RDMA completion notifies.
+	 * Dense rendezvous collectives retire many RDMA reads at once; a deeper
+	 * batch drains them in fewer recvmsg calls (RDS leaves any overflow
+	 * queued for the next call, so this is throughput, not correctness). */
+	ep->cmsg_size = CMSG_SPACE(sizeof(struct rds_rdma_notify)) * 64;
 	ep->cmsg_buf = malloc(ep->cmsg_size);
 	if (!ep->cmsg_buf) {
 		ret = -FI_ENOMEM;
