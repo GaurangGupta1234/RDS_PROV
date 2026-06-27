@@ -136,12 +136,34 @@ static struct rds_peer *rds_peer_create(struct rds_ep *ep, fi_addr_t addr)
 		goto err;
 	*peer->credit_cell = 0;
 
-	peer->rx_ring_mr = rds_reg_internal(ep, peer->rx_ring, ring_bytes,
-					    FI_REMOTE_WRITE);
-	peer->credit_mr = rds_reg_internal(ep, (void *) peer->credit_cell,
-					   sizeof(uint64_t), FI_REMOTE_WRITE);
-	if (!peer->rx_ring_mr || !peer->credit_mr)
-		goto err;
+	/*
+	 * Register the local receive ring and credit cell so the peer can
+	 * RDMA-write into them, naming this peer as the registration dest (@sa).
+	 * If registration fails the peer is marked RDS_PEER_DISABLED and
+	 * permanently uses the datagram path -- never silently dropped.  We keep
+	 * the peer object so we do not retry the failing registration on every
+	 * send.
+	 */
+	{
+		int err = 0;
+		peer->rx_ring_mr = rds_reg_internal(ep, peer->rx_ring,
+						    ring_bytes, FI_REMOTE_WRITE,
+						    &err, sa);
+		peer->credit_mr = rds_reg_internal(ep, (void *) peer->credit_cell,
+						   sizeof(uint64_t),
+						   FI_REMOTE_WRITE, &err, sa);
+		if (!peer->rx_ring_mr || !peer->credit_mr) {
+			rds_mr_put(peer->rx_ring_mr);
+			rds_mr_put(peer->credit_mr);
+			peer->rx_ring_mr = NULL;
+			peer->credit_mr = NULL;
+			peer->state = RDS_PEER_DISABLED;
+			FI_INFO(&rds_prov, FI_LOG_EP_CTRL,
+				"eager ring registration failed for a peer "
+				"(err %d); using the datagram path for it.\n",
+				err);
+		}
+	}
 
 	dlist_insert_head(&peer->bucket, &ep->peer_hash[rds_peer_hash(addr)]);
 	dlist_insert_head(&peer->lru, &ep->peer_lru);
@@ -232,8 +254,19 @@ void rds_ring_handle_ctrl(struct rds_ep *ep, struct rds_hdr *hdr, void *payload,
 			return;		/* at cap; peer keeps using datagrams */
 	}
 
-	if (rds_ring_adopt(ep, peer, &info))
+	/* Our own ring is unusable (registration failed): do not advertise it.
+	 * The requester gets no ACK and keeps using the datagram path for us. */
+	if (peer->state == RDS_PEER_DISABLED || !peer->rx_ring_mr ||
+	    !peer->credit_mr)
 		return;
+
+	/* Geometry mismatch (ranks configured with different FI_RDS_RING_*):
+	 * give up on the ring for this peer rather than leave the requester
+	 * spinning until its handshake deadline. */
+	if (rds_ring_adopt(ep, peer, &info)) {
+		peer->state = RDS_PEER_DISABLED;
+		return;
+	}
 
 	/* A REQ always warrants an ACK so the requester learns our geometry;
 	 * an ACK completes our side. Either way we are now READY. */
@@ -257,7 +290,7 @@ static void rds_ring_refresh_credit(struct rds_peer *peer)
 ssize_t rds_ring_send(struct rds_ep *ep, const struct iovec *iov,
 		      size_t iov_count, fi_addr_t dest, uint64_t tag,
 		      uint64_t data, void *context, uint64_t flags, int tagged,
-		      int gen_comp)
+		      int gen_comp, uint8_t op)
 {
 	struct rds_peer *peer;
 	struct rds_ring_slot *slot;
@@ -295,11 +328,39 @@ ssize_t rds_ring_send(struct rds_ep *ep, const struct iovec *iov,
 	dlist_insert_head(&peer->lru, &ep->peer_lru);
 
 	if (peer->state != RDS_PEER_READY) {
+		/*
+		 * Ring permanently unavailable for this peer -> datagram path.
+		 */
+		if (peer->state == RDS_PEER_DISABLED)
+			return -FI_ENOSYS;
+		/*
+		 * Handshake not finished.  We must NOT spill onto the datagram
+		 * channel here: a later message could overtake an earlier one
+		 * still queued for the ring and break FI_ORDER_SAS.  Kick the
+		 * handshake (once) and return -FI_EAGAIN so the caller retries
+		 * after progressing the CQ -- by then the RING_ACK has been
+		 * processed and the peer is READY, so every message to this
+		 * peer travels the one ordered ring channel.
+		 */
 		if (peer->state == RDS_PEER_NONE) {
 			rds_ring_send_ctrl(ep, peer, RDS_OP_RING_REQ);
 			peer->state = RDS_PEER_CONNECTING;
+			peer->connect_start_ms = ofi_gettime_ms();
 		}
-		return -FI_ENOSYS;	/* handshake pending -> datagram now */
+		/*
+		 * Liveness guard: if the peer never ACKs (its ring registration
+		 * failed, or it is past its own resident cap) give up after the
+		 * deadline and use the datagram path instead of spinning forever.
+		 */
+		if (ofi_gettime_ms() - peer->connect_start_ms >
+		    RDS_RING_CONNECT_TIMEOUT_MS) {
+			peer->state = RDS_PEER_DISABLED;
+			FI_INFO(&rds_prov, FI_LOG_EP_CTRL,
+				"eager ring handshake timed out for a peer; "
+				"using the datagram path for it.\n");
+			return -FI_ENOSYS;
+		}
+		return -FI_EAGAIN;	/* wait for the handshake */
 	}
 
 	rds_ring_refresh_credit(peer);
@@ -317,6 +378,7 @@ ssize_t rds_ring_send(struct rds_ep *ep, const struct iovec *iov,
 	stage = peer->tx_stage + idx * ep->ring_slot_size;
 	slot = (struct rds_ring_slot *) stage;
 	slot->len = (uint32_t) total;
+	slot->op = op;				/* EAGER, or encapsulated RTS/FIN */
 	slot->flags = (tagged ? RDS_HF_TAGGED : 0) |
 		      ((flags & FI_REMOTE_CQ_DATA) ? RDS_HF_CQ_DATA : 0);
 	slot->tag = tag;
@@ -369,17 +431,44 @@ void rds_ring_deliver(struct rds_ep *ep, struct rds_peer *peer,
 {
 	struct rds_hdr hdr;
 
-	/* Re-use the datagram matching/delivery engine by synthesising the
-	 * header that an eager datagram would have carried. */
-	memset(&hdr, 0, sizeof(hdr));
-	hdr.magic = RDS_HDR_MAGIC;
-	hdr.op = RDS_OP_EAGER;
-	hdr.flags = slot->flags;
-	hdr.tag = slot->tag;
-	hdr.data = slot->data;
-	hdr.size = slot->len;
+	if (slot->op == RDS_OP_EAGER) {
+		/* Re-use the datagram matching/delivery engine by synthesising
+		 * the header that an eager datagram would have carried. */
+		memset(&hdr, 0, sizeof(hdr));
+		hdr.magic = RDS_HDR_MAGIC;
+		hdr.op = RDS_OP_EAGER;
+		hdr.flags = slot->flags;
+		hdr.tag = slot->tag;
+		hdr.data = slot->data;
+		hdr.size = slot->len;
 
-	rds_handle_inbound(ep, &hdr, payload, slot->len, &peer->sa, peer->addr);
+		rds_handle_inbound(ep, &hdr, payload, slot->len, &peer->sa,
+				   peer->addr);
+		return;
+	}
+
+	/*
+	 * A control datagram (RTS / FIN) ferried whole over the ring: the slot
+	 * payload is [rds_hdr | descriptor].  Feeding it through the same
+	 * inbound path the socket uses keeps rendezvous semantics identical
+	 * whether the RTS arrived on the ring or the socket.  peer->addr is a
+	 * resolved fi_addr and peer->sa the source sockaddr, so the FIN this
+	 * triggers can always be addressed (see rds_send_fin).
+	 */
+	if (slot->len < sizeof(struct rds_hdr)) {
+		FI_WARN(&rds_prov, FI_LOG_EP_DATA,
+			"runt control slot on ring (%u bytes); dropping\n",
+			slot->len);
+		return;
+	}
+	{
+		struct rds_hdr *real_hdr = (struct rds_hdr *) payload;
+		void *real_payload = (char *) payload + sizeof(struct rds_hdr);
+		size_t real_len = slot->len - sizeof(struct rds_hdr);
+
+		rds_handle_inbound(ep, real_hdr, real_payload, real_len,
+				   &peer->sa, peer->addr);
+	}
 }
 
 static void rds_ring_poll_peer(struct rds_ep *ep, struct rds_peer *peer)

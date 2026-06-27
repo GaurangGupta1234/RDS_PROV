@@ -22,13 +22,27 @@
 /*
  * Low level: pin @buf/@len on @sock and return the cookie.  Used both by
  * fi_mr_reg (app windows) and by the internal rendezvous source registration.
+ *
+ * @dest selects the registration API:
+ *   - non-NULL (rendezvous source: the receiver) -> RDS_GET_MR_FOR_DEST.  This
+ *     is the path that succeeds on the target box; plain RDS_GET_MR was rejected
+ *     there.  Upstream net/rds ignores dest_addr (for-dest just behaves like
+ *     get_mr), so passing the receiver is harmless and future-proof.
+ *   - NULL (app fi_mr_reg window, no single destination) -> plain RDS_GET_MR.
+ *     MPI RMA is disabled in the benchmark configuration so app windows are not
+ *     exercised, but we still attempt the registration.
+ *
+ * Either way the cookie is make_cookie(r_key, page_offset) -- a device-PD r_key
+ * with no destination component -- so callers may cache and reuse it for any
+ * peer regardless of @dest.
  */
 static int rds_kernel_reg(int sock, const void *buf, size_t len,
-			  uint64_t access, rds_rdma_cookie_t *cookie_out)
+			  uint64_t access, rds_rdma_cookie_t *cookie_out,
+			  const void *dest)
 {
-	struct rds_get_mr_args args;
 	rds_rdma_cookie_t cookie = 0;
 	uint64_t flags = 0;
+	int ret;
 
 	if (len > RDS_KERNEL_SEG_MAX) {
 		FI_WARN(&rds_prov, FI_LOG_MR,
@@ -46,18 +60,42 @@ static int rds_kernel_reg(int sock, const void *buf, size_t len,
 	if (access & (FI_REMOTE_WRITE | FI_REMOTE_READ | FI_WRITE | FI_READ))
 		flags |= RDS_RDMA_READWRITE;
 
-	memset(&args, 0, sizeof(args));
-	args.vec.addr = (uint64_t) (uintptr_t) buf;
-	args.vec.bytes = len;
-	args.cookie_addr = (uint64_t) (uintptr_t) &cookie;
-	args.flags = flags;
+	if (dest) {
+		struct rds_get_mr_for_dest_args args;
 
-	if (setsockopt(sock, SOL_RDS, RDS_GET_MR, &args, sizeof(args))) {
-		FI_WARN(&rds_prov, FI_LOG_MR,
-			"RDS_GET_MR failed: %s. If this is ENOTCONN/EINVAL the "
-			"registration socket may need a proxy QP (see "
-			"RDS_KERNEL_CHANGES.md).\n", strerror(errno));
-		return -errno;
+		memset(&args, 0, sizeof(args));
+		args.vec.addr = (uint64_t) (uintptr_t) buf;
+		args.vec.bytes = len;
+		args.cookie_addr = (uint64_t) (uintptr_t) &cookie;
+		args.flags = flags;
+		memcpy(&args.dest_addr, dest, sizeof(struct sockaddr_in));
+
+		ret = setsockopt(sock, SOL_RDS, RDS_GET_MR_FOR_DEST, &args,
+				 sizeof(args));
+	} else {
+		struct rds_get_mr_args args;
+
+		memset(&args, 0, sizeof(args));
+		args.vec.addr = (uint64_t) (uintptr_t) buf;
+		args.vec.bytes = len;
+		args.cookie_addr = (uint64_t) (uintptr_t) &cookie;
+		args.flags = flags;
+
+		ret = setsockopt(sock, SOL_RDS, RDS_GET_MR, &args, sizeof(args));
+	}
+
+	if (ret) {
+		int err = errno;
+		/* EOPNOTSUPP just means "no ring/no for-dest support"; callers
+		 * fall back, so do not spam the log for it. */
+		if (err != EOPNOTSUPP)
+			FI_WARN(&rds_prov, FI_LOG_MR,
+				"RDS_GET_MR%s failed: %s. If this is "
+				"ENOTCONN/EINVAL the registration may need a "
+				"connected peer or a proxy QP (see "
+				"RDS_KERNEL_CHANGES.md).\n",
+				dest ? "_FOR_DEST" : "", strerror(err));
+		return -err;
 	}
 
 	*cookie_out = cookie;
@@ -79,17 +117,24 @@ static void rds_kernel_free(int sock, rds_rdma_cookie_t cookie)
  * future MR cache can hand the same registration to several in-flight sends.
  */
 struct rds_mr *rds_reg_internal(struct rds_ep *ep, const void *buf, size_t len,
-				uint64_t access)
+				uint64_t access, int *err_out, const void *dest)
 {
 	struct rds_mr *mr;
 	rds_rdma_cookie_t cookie;
+	int ret;
 
-	if (rds_kernel_reg(ep->sock, buf, len, access, &cookie))
+	ret = rds_kernel_reg(ep->sock, buf, len, access, &cookie, dest);
+	if (ret) {
+		if (err_out)
+			*err_out = ret;
 		return NULL;
+	}
 
 	mr = calloc(1, sizeof(*mr));
 	if (!mr) {
 		rds_kernel_free(ep->sock, cookie);
+		if (err_out)
+			*err_out = -FI_ENOMEM;
 		return NULL;
 	}
 
@@ -136,9 +181,17 @@ static int rds_cache_add_region(struct ofi_mr_cache *cache,
 	if (!domain->reg_ep)
 		return -FI_EOPBADSTATE;
 
+	/*
+	 * domain->reg_dest was stashed under ep->lock by the rendezvous send
+	 * path immediately before this lookup (the cache API gives us no
+	 * destination argument).  It names a connected peer so the FRMR
+	 * registration WR has a QP to post on; the resulting cookie is
+	 * device-global and is what we cache and reuse for every destination.
+	 */
 	ret = rds_kernel_reg(domain->reg_ep->sock, entry->info.iov.iov_base,
 			     entry->info.iov.iov_len,
-			     FI_REMOTE_READ | FI_REMOTE_WRITE, &cookie);
+			     FI_REMOTE_READ | FI_REMOTE_WRITE, &cookie,
+			     domain->reg_dest);
 	if (ret)
 		return ret;
 
@@ -164,6 +217,14 @@ int rds_mr_cache_open(struct rds_domain *domain)
 		[FI_HMEM_SYSTEM] = default_monitor,
 	};
 	int ret;
+
+	if (!rds_mr_cache_enable) {
+		FI_INFO(&rds_prov, FI_LOG_MR,
+			"rendezvous MR cache disabled (FI_RDS_MR_CACHE=0); "
+			"registering per message.\n");
+		domain->cache_enabled = 0;
+		return 0;
+	}
 
 	domain->mr_cache.entry_data_size = sizeof(struct rds_cached_mr);
 	domain->mr_cache.add_region = rds_cache_add_region;
@@ -207,7 +268,8 @@ void rds_mr_cache_close(struct rds_domain *domain)
 }
 
 int rds_reg_cache_get(struct rds_ep *ep, const void *buf, size_t len,
-		      rds_rdma_cookie_t *cookie, struct ofi_mr_entry **entry)
+		      rds_rdma_cookie_t *cookie, struct ofi_mr_entry **entry,
+		      const void *dest, size_t dest_len)
 {
 	struct rds_domain *domain;
 	struct ofi_mr_info info = {0};
@@ -223,7 +285,13 @@ int rds_reg_cache_get(struct rds_ep *ep, const void *buf, size_t len,
 	info.iov.iov_len = len;
 	info.iface = FI_HMEM_SYSTEM;
 
+	/* Hand the connected destination to the (argument-less) add_region
+	 * callback for RDS_GET_MR_FOR_DEST.  Safe: caller holds ep->lock. */
+	domain->reg_dest = dest;
+	domain->reg_dest_len = dest_len;
 	ret = ofi_mr_cache_search(&domain->mr_cache, &info, &e);
+	domain->reg_dest = NULL;
+	domain->reg_dest_len = 0;
 	if (ret)
 		return ret;
 
@@ -281,7 +349,8 @@ static int rds_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
 	buf = attr->mr_iov[0].iov_base;
 	len = attr->mr_iov[0].iov_len;
 
-	mr = rds_reg_internal(domain->reg_ep, buf, len, attr->access);
+	/* App window: no single destination, so plain RDS_GET_MR (dest NULL). */
+	mr = rds_reg_internal(domain->reg_ep, buf, len, attr->access, NULL, NULL);
 	if (!mr)
 		return -FI_ENOMEM;
 

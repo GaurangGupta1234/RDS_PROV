@@ -255,6 +255,7 @@ static int rds_ep_close(struct fid *fid)
 		domain->reg_ep = NULL;
 
 	rds_ep_ring_cleanup(ep);
+	rds_ep_flush_deferred(ep);
 	rds_ep_flush_lists(ep);
 
 	if (ep->sock >= 0)
@@ -302,6 +303,28 @@ static int rds_ep_init_socket(struct rds_ep *ep, struct fi_info *info)
 		goto err;
 	}
 
+	/*
+	 * Optional socket-buffer sizing.  Larger buffers let more datagrams be
+	 * in flight before sendmsg returns EAGAIN, smoothing the bursts a
+	 * many-to-many collective generates on the single RDS connection shared
+	 * by a node pair.  Best-effort: the kernel clamps to net.core.*mem_max
+	 * and we ignore failures.  Default 0 leaves the kernel value untouched.
+	 */
+	if (rds_sndbuf) {
+		int v = (int) rds_sndbuf;
+		if (setsockopt(ep->sock, SOL_SOCKET, SO_SNDBUF, &v, sizeof(v)))
+			FI_INFO(&rds_prov, FI_LOG_EP_CTRL,
+				"SO_SNDBUF=%d rejected: %s\n", v,
+				strerror(errno));
+	}
+	if (rds_rcvbuf) {
+		int v = (int) rds_rcvbuf;
+		if (setsockopt(ep->sock, SOL_SOCKET, SO_RCVBUF, &v, sizeof(v)))
+			FI_INFO(&rds_prov, FI_LOG_EP_CTRL,
+				"SO_RCVBUF=%d rejected: %s\n", v,
+				strerror(errno));
+	}
+
 	if (info->src_addr) {
 		ret = rds_setname(&ep->util_ep.ep_fid.fid, info->src_addr,
 				  info->src_addrlen);
@@ -338,6 +361,7 @@ int rds_endpoint(struct fid_domain *domain, struct fi_info *info,
 	dlist_init(&ep->rx_unexp_msg);
 	dlist_init(&ep->rx_unexp_tag);
 	dlist_init(&ep->pending);
+	dlist_init(&ep->deferred);
 	rds_ep_ring_init(ep);
 
 	ret = ofi_endpoint_init(domain, &rds_util_prov, info, &ep->util_ep,

@@ -140,6 +140,10 @@ void rds_pending_complete(struct rds_ep *ep, struct rds_pending *pend)
 					pend->len, pend->error);
 	}
 
+	/* Release the rendezvous-TX flow-control slot. */
+	if (pend->type == RDS_PEND_RNDZV_TX && ep->rndzv_tx_inflight)
+		ep->rndzv_tx_inflight--;
+
 	rds_pending_release_mrs(ep, pend);
 	free(pend->bounce);
 	dlist_remove(&pend->entry);
@@ -150,12 +154,26 @@ void rds_pending_complete(struct rds_ep *ep, struct rds_pending *pend)
 /* wire helpers						      */
 /* ------------------------------------------------------------------ */
 
-static void rds_send_fin(struct rds_ep *ep, const union ofi_sock_ip *peer,
-			 uint64_t id)
+/*
+ * The FIN (rendezvous receiver -> sender ack) and the rendezvous RDMA READs are
+ * the two operations the provider must complete itself and cannot return to the
+ * application as -FI_EAGAIN.  Both therefore travel the reliable RDS datagram
+ * socket -- never the eager ring, whose reverse-direction addressing was the
+ * source of the "16 KiB hang" (a FIN routed onto the ring was silently lost,
+ * leaving the sender waiting forever).  When the socket send queue is
+ * momentarily full they are parked on ep->deferred and re-issued in FIFO order
+ * from progress, so a full queue becomes back-pressure rather than a lost
+ * message.  This is the heart of the no-hang / no-drop guarantee.
+ */
+
+/* Raw FIN datagram send; returns 0, -FI_EAGAIN (queue full), or -errno. */
+static ssize_t rds_send_fin_raw(struct rds_ep *ep,
+				const union ofi_sock_ip *peer, uint64_t id)
 {
 	struct rds_hdr hdr;
 	struct iovec iov;
 	struct msghdr msg;
+	ssize_t ret;
 
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.magic = RDS_HDR_MAGIC;
@@ -171,9 +189,79 @@ static void rds_send_fin(struct rds_ep *ep, const union ofi_sock_ip *peer,
 	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
 
-	/* Best effort: if this is dropped the sender leaks one registration
-	 * until ep close. It should not be dropped on a reliable transport. */
-	(void) sendmsg(ep->sock, &msg, 0);
+	ret = sendmsg(ep->sock, &msg, 0);
+	if (ret < 0)
+		return (errno == EAGAIN || errno == ENOBUFS) ?
+			-FI_EAGAIN : -errno;
+	return 0;
+}
+
+/* Park a socket op for retry from progress (FIFO). */
+static int rds_defer_enqueue(struct rds_ep *ep, struct rds_deferred *d)
+{
+	dlist_insert_tail(&d->entry, &ep->deferred);
+	return 0;
+}
+
+static void rds_defer_fin(struct rds_ep *ep, const union ofi_sock_ip *peer,
+			  uint64_t id)
+{
+	struct rds_deferred *d = calloc(1, sizeof(*d));
+
+	if (!d) {
+		/* OOM parking a FIN: the only consequence is the sender leaks
+		 * one source registration until ep close.  Extremely unlikely
+		 * (8-byte-ish struct) and never a hang on the receiver. */
+		FI_WARN(&rds_prov, FI_LOG_EP_DATA,
+			"out of memory deferring FIN; sender may leak one MR\n");
+		return;
+	}
+	d->type = RDS_DEFERRED_FIN;
+	d->peer = *peer;
+	d->peerlen = ofi_sizeofaddr((const struct sockaddr *) peer);
+	d->id = id;
+	rds_defer_enqueue(ep, d);
+}
+
+/* Park a rendezvous READ segment for retry.  Returns 0 or -FI_ENOMEM. */
+static int rds_defer_read(struct rds_ep *ep, const union ofi_sock_ip *peer,
+			  rds_rdma_cookie_t cookie, uint64_t remote_off,
+			  const struct iovec *liov, size_t lcnt, uint64_t token)
+{
+	struct rds_deferred *d = calloc(1, sizeof(*d));
+
+	if (!d)
+		return -FI_ENOMEM;
+	d->type = RDS_DEFERRED_READ;
+	d->peer = *peer;
+	d->peerlen = ofi_sizeofaddr((const struct sockaddr *) peer);
+	d->cookie = cookie;
+	d->remote_off = remote_off;
+	memcpy(d->liov, liov, lcnt * sizeof(*liov));
+	d->lcnt = lcnt;
+	d->id = token;
+	return rds_defer_enqueue(ep, d);
+}
+
+static void rds_send_fin(struct rds_ep *ep, const union ofi_sock_ip *peer,
+			 uint64_t id)
+{
+	ssize_t ret;
+
+	/* If anything is already parked, queue behind it so the socket drains
+	 * strictly in order. */
+	if (!dlist_empty(&ep->deferred)) {
+		rds_defer_fin(ep, peer, id);
+		return;
+	}
+
+	ret = rds_send_fin_raw(ep, peer, id);
+	if (ret == -FI_EAGAIN)
+		rds_defer_fin(ep, peer, id);
+	else if (ret < 0)
+		FI_WARN(&rds_prov, FI_LOG_EP_DATA,
+			"FIN send failed (%zd) on a reliable transport; sender "
+			"may leak one MR\n", ret);
 }
 
 /* Slice [off, off+len) of a source iov array into a destination iov array. */
@@ -353,18 +441,40 @@ static void rds_start_rndzv_read(struct rds_ep *ep, struct rds_rx_entry *rx,
 				    (rds_rdma_cookie_t) segs[i].cookie,
 				    segs[i].off, liov, lcnt, 0 /* read */,
 				    1 /* notify */, pend->id);
-		if (ret) {
+		if (ret == 0) {
+			pend->seg_remaining++;
+			pend->seg_total++;
+		} else if (ret == -FI_EAGAIN) {
+			/*
+			 * Socket send queue full: park this READ and retry it
+			 * from progress.  Never dropped -- dropping it would
+			 * stall the whole rendezvous receive (a collective-storm
+			 * hang).  The local slice points into the application
+			 * receive buffer, which stays valid until we finalize.
+			 */
+			if (rds_defer_read(ep, peer,
+					   (rds_rdma_cookie_t) segs[i].cookie,
+					   segs[i].off, liov, lcnt,
+					   pend->id) == 0) {
+				pend->seg_deferred++;
+				pend->seg_total++;
+			} else if (!pend->error) {
+				pend->error = FI_ENOMEM;
+			}
+		} else {
+			/* Hard error on this segment: record and skip it. */
 			if (!pend->error)
 				pend->error = -ret;
-			break;
 		}
-		pend->seg_remaining++;
-		pend->seg_total++;
 	}
 
-	/* If nothing was issued (zero length or all reads failed) finalize now;
-	 * otherwise the last RDS_CMSG_RDMA_STATUS will finalize. */
-	if (pend->seg_remaining == 0)
+	/*
+	 * Finalize now only if there is nothing in flight and nothing parked
+	 * (zero length, or every read failed hard).  Otherwise the op
+	 * finalizes when the last RDS_CMSG_RDMA_STATUS arrives (in-flight
+	 * reads) and/or the last parked read is issued and acknowledged.
+	 */
+	if (pend->seg_remaining == 0 && pend->seg_deferred == 0)
 		rds_rndzv_rx_finalize(ep, pend);
 }
 
@@ -483,10 +593,80 @@ void rds_handle_rdma_notify(struct rds_ep *ep, uint64_t token, int status)
 		rds_pending_complete(ep, pend);
 		break;
 	case RDS_PEND_RNDZV_RX:
-		rds_rndzv_rx_finalize(ep, pend);
+		/* Hold off if some reads are still parked for retry; the last
+		 * one issued+acknowledged will finalize instead. */
+		if (pend->seg_deferred == 0)
+			rds_rndzv_rx_finalize(ep, pend);
 		break;
 	default:
 		break;
+	}
+}
+
+/*
+ * Re-issue parked FINs and rendezvous READs in FIFO order.  Called first in
+ * every progress pass.  Stops at the first op the socket still rejects with
+ * -FI_EAGAIN (the queue is still full) and returns -FI_EAGAIN so the caller can
+ * skip the rest of progress cheaply; returns 0 once the queue is empty.
+ */
+int rds_progress_deferred(struct rds_ep *ep)
+{
+	struct rds_deferred *d;
+	struct rds_pending *pend;
+	ssize_t ret;
+
+	while (!dlist_empty(&ep->deferred)) {
+		d = container_of(ep->deferred.next, struct rds_deferred, entry);
+
+		if (d->type == RDS_DEFERRED_FIN) {
+			ret = rds_send_fin_raw(ep, &d->peer, d->id);
+			if (ret == -FI_EAGAIN)
+				return -FI_EAGAIN;	/* still full */
+			dlist_remove(&d->entry);
+			free(d);
+			continue;
+		}
+
+		/* RDS_DEFERRED_READ */
+		pend = rds_pending_find(ep, d->id);
+		if (!pend) {
+			/* Owning op already gone (teardown / hard-errored out):
+			 * just discard the parked read. */
+			dlist_remove(&d->entry);
+			free(d);
+			continue;
+		}
+
+		ret = rds_post_rdma(ep, &d->peer, d->peerlen, d->cookie,
+				    d->remote_off, d->liov, d->lcnt,
+				    0 /* read */, 1 /* notify */, d->id);
+		if (ret == -FI_EAGAIN)
+			return -FI_EAGAIN;	/* still full; retry next pass */
+
+		dlist_remove(&d->entry);
+		free(d);
+		pend->seg_deferred--;
+		if (ret == 0) {
+			pend->seg_remaining++;	/* now awaiting its notify */
+		} else if (!pend->error) {
+			pend->error = (ret < 0) ? (int) -ret : (int) ret;
+		}
+		/* If that was the last piece (and none in flight), finalize. */
+		if (pend->seg_remaining == 0 && pend->seg_deferred == 0)
+			rds_rndzv_rx_finalize(ep, pend);
+	}
+	return 0;
+}
+
+void rds_ep_flush_deferred(struct rds_ep *ep)
+{
+	struct dlist_entry *item, *tmp;
+	struct rds_deferred *d;
+
+	dlist_foreach_safe(&ep->deferred, item, tmp) {
+		d = container_of(item, struct rds_deferred, entry);
+		dlist_remove(&d->entry);
+		free(d);
 	}
 }
 
@@ -610,7 +790,7 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 			      size_t iov_count, const void *dest,
 			      size_t destlen, uint64_t tag, uint64_t data,
 			      void *context, uint64_t flags, int tagged,
-			      int gen_comp)
+			      int gen_comp, fi_addr_t dest_addr)
 {
 	struct rds_domain *domain;
 	struct rds_pending *pend;
@@ -623,6 +803,18 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 	size_t total, nseg = 0, i, k;
 	int cached;
 	ssize_t ret;
+
+	/*
+	 * Flow control: bound the number of rendezvous sends in flight (each
+	 * holds a source registration and an outstanding RTS/FIN round-trip).
+	 * Past the cap we return -FI_EAGAIN so the application throttles itself
+	 * instead of flooding the shared RDS connection -- the mechanism that
+	 * keeps many-to-many collectives (alltoall/allgather) from melting down
+	 * into an RTS/FIN storm.  No deadlock: in-flight sends complete
+	 * independently of any send this rank is throttling.
+	 */
+	if (ep->rndzv_tx_inflight >= rds_rndzv_max_inflight)
+		return -FI_EAGAIN;
 
 	domain = container_of(ep->util_ep.domain, struct rds_domain,
 			      util_domain);
@@ -670,14 +862,16 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 
 			if (cached) {
 				ret = rds_reg_cache_get(ep, base, clen, &cookie,
-							&cmrs[k]);
+							&cmrs[k], dest, destlen);
 				if (ret)
 					goto err_unreg;
 			} else {
+				int err = 0;
 				struct rds_mr *mr = rds_reg_internal(ep, base,
-							clen, FI_REMOTE_READ);
+							clen, FI_REMOTE_READ,
+							&err, dest);
 				if (!mr) {
-					ret = -FI_ENOMEM;
+					ret = err ? err : -FI_ENOMEM;
 					goto err_unreg;
 				}
 				mrs[k] = mr;
@@ -720,6 +914,32 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 	siov[1].iov_base = segs;
 	siov[1].iov_len = nseg * sizeof(*segs);
 
+	/*
+	 * When the eager ring is up for this peer, ship the RTS over it so the
+	 * whole forward path to this peer (eager + rendezvous control) travels
+	 * one ordered channel -- preserving FI_ORDER_SAS without a second
+	 * (datagram) channel that could overtake it.  rds_ring_send returns:
+	 *   -FI_ENOSYS : ring not usable (peer disabled / at cap / RTS too big
+	 *                for a slot) -> fall through to the datagram RTS below;
+	 *   -FI_EAGAIN : ring busy / handshaking -> bubble up so the caller
+	 *                retries (we must not spill onto the datagram channel);
+	 *   0          : RTS placed in the ring.
+	 */
+	if (ep->eager_rdma) {
+		ret = rds_ring_send(ep, siov, 2, dest_addr, 0, 0, NULL, 0, 0, 0,
+				    RDS_OP_RTS);
+		if (ret != -FI_ENOSYS) {
+			if (ret < 0) {
+				dlist_remove(&pend->entry);
+				free(pend);
+				goto err_unreg;
+			}
+			free(segs);
+			ep->rndzv_tx_inflight++;
+			return 0;
+		}
+	}
+
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_name = (void *) dest;
 	msg.msg_namelen = (socklen_t) destlen;
@@ -736,6 +956,7 @@ static ssize_t rds_send_rndzv(struct rds_ep *ep, const struct iovec *iov,
 	}
 
 	free(segs);	/* the kernel copied them during sendmsg */
+	ep->rndzv_tx_inflight++;
 	/* mr ownership transferred to pend; released on FIN. */
 	return 0;
 
@@ -783,17 +1004,26 @@ ssize_t rds_generic_send(struct rds_ep *ep, const struct iovec *iov,
 	 * or peer past the resident cap). */
 	if (ep->eager_rdma && total <= ep->ring_payload) {
 		ret = rds_ring_send(ep, iov, iov_count, dest_addr, tag, data,
-				    context, flags, tagged, gen_comp);
+				    context, flags, tagged, gen_comp,
+				    RDS_OP_EAGER);
 		if (ret != -FI_ENOSYS)
 			goto out;	/* 0 (sent) or -FI_EAGAIN (retry) */
 	}
 
-	if (total <= rds_eager_size)
+	/*
+	 * With the ring enabled, anything larger than one ring slot goes
+	 * rendezvous (its RTS rides the same ordered ring channel), so the
+	 * forward path to a READY peer never splits across two channels.  With
+	 * the ring disabled (the scalable default), the datagram eager path
+	 * covers everything up to rds_eager_size.
+	 */
+	if (total <= (ep->eager_rdma ? ep->ring_payload : rds_eager_size))
 		ret = rds_send_eager(ep, iov, iov_count, dest, destlen, tag,
 				     data, context, flags, tagged, gen_comp);
 	else
 		ret = rds_send_rndzv(ep, iov, iov_count, dest, destlen, tag,
-				     data, context, flags, tagged, gen_comp);
+				     data, context, flags, tagged, gen_comp,
+				     dest_addr);
 out:
 	ofi_genlock_unlock(&ep->util_ep.lock);
 	return ret;
@@ -822,7 +1052,7 @@ static ssize_t rds_generic_inject(struct rds_ep *ep, const void *buf,
 	/* Inject must share the send channel for ordering; try the ring first. */
 	if (ep->eager_rdma && len <= ep->ring_payload) {
 		ret = rds_ring_send(ep, &iov, 1, dest_addr, tag, 0, NULL, 0,
-				    tagged, 0 /* no completion */);
+				    tagged, 0 /* no completion */, RDS_OP_EAGER);
 		if (ret != -FI_ENOSYS)
 			goto out;
 	}

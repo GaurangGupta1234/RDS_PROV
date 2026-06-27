@@ -7,13 +7,46 @@
 #include <stdlib.h>
 #include "rds.h"
 
+/*
+ * Completion counters (FI_CNTR).  Intel MPI's CH4/OFI init binds a counter to
+ * the endpoint and aborts MPI_Init with "unsupported feature" if the provider
+ * stubs cntr_open out, so we must provide one.  ofi_cntr_progress drives
+ * rds_ep_progress when the counter is read, and ofi_cntr_init asserts a non-NULL
+ * progress fn (the golden patch's NULL aborts debug builds -- fixed here).
+ *
+ * Note: the counter is advertised but its value is not yet incremented on
+ * completion (the message path uses the CQ, and MPI runs with RMA/atomics
+ * disabled, so nothing waits on the counter).  Wiring ofi_cntr increments into
+ * rds_cq_write_tx/rx is future work -- see docs/ARCHITECTURE.md.
+ */
+static int rds_cntr_open(struct fid_domain *domain, struct fi_cntr_attr *attr,
+			 struct fid_cntr **cntr_fid, void *context)
+{
+	struct util_cntr *cntr;
+	int ret;
+
+	cntr = calloc(1, sizeof(*cntr));
+	if (!cntr)
+		return -FI_ENOMEM;
+
+	ret = ofi_cntr_init(&rds_prov, domain, attr, cntr, &ofi_cntr_progress,
+			    context);
+	if (ret) {
+		free(cntr);
+		return ret;
+	}
+
+	*cntr_fid = &cntr->cntr_fid;
+	return 0;
+}
+
 static struct fi_ops_domain rds_domain_ops = {
 	.size			= sizeof(struct fi_ops_domain),
 	.av_open		= ofi_ip_av_create,
 	.cq_open		= rds_cq_open,
 	.endpoint		= rds_endpoint,
 	.scalable_ep		= fi_no_scalable_ep,
-	.cntr_open		= fi_no_cntr_open,
+	.cntr_open		= rds_cntr_open,
 	.poll_open		= fi_poll_create,
 	.stx_ctx		= fi_no_stx_context,
 	.srx_ctx		= fi_no_srx_context,

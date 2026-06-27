@@ -110,6 +110,20 @@
 #define RDS_CMSG_RDMA_STATUS	4
 #endif
 
+/*
+ * RDS_GET_MR_FOR_DEST (setsockopt opt 7, struct rds_get_mr_for_dest_args from
+ * <linux/rds.h>) registers a memory region and returns an rds_rdma_cookie_t.
+ * In upstream net/rds/rdma.c, rds_get_mr_for_dest() ignores dest_addr and just
+ * forwards to __rds_rdma_map() ("Initially, just behave like get_mr()"), and the
+ * cookie is make_cookie(mr->r_key, addr & ~PAGE_MASK) -- a device-PD r_key plus
+ * a page offset, with no destination component.  So the cookie is
+ * destination-independent and may be cached and reused for any peer.  We use the
+ * for-dest opt because it is what succeeds on the target box (plain RDS_GET_MR
+ * was rejected there -- an ABI/vintage quirk at the call site, not a difference
+ * in the key).  RDS_GET_MR_FOR_DEST and its args struct are stable RDS UAPI; we
+ * do not redefine the struct here.  See docs/ARCHITECTURE.md "MR registration".
+ */
+
 #ifndef RDS_RDMA_READWRITE
 #define RDS_RDMA_READWRITE	0x0001
 #endif
@@ -167,6 +181,17 @@
 #define RDS_DEF_RING_SLOTS	16	/* slots per peer ring (power of 2) */
 #define RDS_DEF_RING_SLOT_SIZE	1024	/* bytes per slot                   */
 #define RDS_DEF_RING_MAX_PEERS	256	/* LRU cap on rings (bounds pinning)*/
+
+/*
+ * If a ring handshake does not reach READY within this many milliseconds the
+ * peer is marked RDS_PEER_DISABLED and falls back to the datagram path.  This is
+ * the liveness guard: a peer whose ring registration failed (or that is past its
+ * own resident cap) never sends a RING_ACK, and without this bound the requester
+ * -- which holds messages off the datagram channel for ordering -- would spin on
+ * -FI_EAGAIN forever.  The handshake is one RTT in the normal case, so this only
+ * ever fires on a genuine failure.
+ */
+#define RDS_RING_CONNECT_TIMEOUT_MS	100
 
 /* Aggregate message ceiling we advertise. We fragment anything above one
  * kernel segment into multiple RDMA-read segments on the rendezvous path. */
@@ -241,7 +266,10 @@ struct rds_ring_info {
 struct rds_ring_slot {
 	uint32_t	len;		/* payload bytes                  */
 	uint8_t		flags;		/* RDS_HF_*                       */
-	uint8_t		resv[3];
+	uint8_t		op;		/* enum rds_op: EAGER or an        */
+					/* encapsulated control datagram   */
+					/* (RTS/FIN) ferried over the ring */
+	uint8_t		resv[2];
 	uint64_t	tag;
 	uint64_t	data;
 	uint64_t	ack;		/* piggybacked credit: sender's   */
@@ -283,6 +311,10 @@ extern int rds_eager_rdma;		/* FI_RDS_EAGER_RDMA (default off)  */
 extern size_t rds_ring_slots;		/* FI_RDS_RING_SLOTS               */
 extern size_t rds_ring_slot_size;	/* FI_RDS_RING_SLOT_SIZE           */
 extern size_t rds_ring_max_peers;	/* FI_RDS_RING_MAX_PEERS           */
+extern int    rds_mr_cache_enable;	/* FI_RDS_MR_CACHE  (default on)   */
+extern size_t rds_rndzv_max_inflight;	/* FI_RDS_RNDZV_INFLIGHT           */
+extern size_t rds_sndbuf;		/* FI_RDS_SNDBUF (0 = leave default) */
+extern size_t rds_rcvbuf;		/* FI_RDS_RCVBUF (0 = leave default) */
 
 int rds_fabric(struct fi_fabric_attr *attr, struct fid_fabric **fabric,
 	       void *context);
@@ -338,6 +370,18 @@ struct rds_domain {
 	 */
 	struct ofi_mr_cache	mr_cache;
 	int			cache_enabled;
+
+	/*
+	 * RDS_GET_MR_FOR_DEST needs a connected destination to post the FRMR
+	 * registration WR against.  The ofi_mr_cache add_region callback has no
+	 * destination argument, so the rendezvous send path stashes the current
+	 * send's destination here (under ep->lock) right before the cache
+	 * lookup; add_region reads it for the registration syscall.  The cookie
+	 * that comes back is device-global, so the cache is still keyed only on
+	 * (buffer,length) -- see docs/ARCHITECTURE.md "MR registration".
+	 */
+	const void		*reg_dest;
+	size_t			reg_dest_len;
 };
 
 /* Per-entry payload stored inside an ofi_mr_cache entry. */
@@ -416,8 +460,13 @@ struct rds_pending {
 	uint64_t		tag;
 	int			error;		/* first failure seen          */
 
-	/* rendezvous accounting */
-	uint32_t		seg_remaining;	/* RX: reads still outstanding */
+	/* rendezvous accounting.  An RX op finalizes only when every segment
+	 * read has both been issued and acknowledged, i.e.
+	 * seg_remaining == 0 && seg_deferred == 0.  seg_deferred counts reads
+	 * that hit -FI_EAGAIN on the socket and were parked on ep->deferred to
+	 * be re-issued from progress (the back-pressure / no-drop path). */
+	uint32_t		seg_remaining;	/* RX: reads issued, awaiting notify */
+	uint32_t		seg_deferred;	/* RX: reads parked for retry        */
 	uint32_t		seg_total;
 	union ofi_sock_ip	peer;		/* RX: where to send FIN       */
 	struct rds_mr		**mrs;		/* TX: uncached source MRs     */
@@ -430,6 +479,41 @@ struct rds_pending {
 };
 
 
+/*
+ * struct rds_deferred - a socket operation parked because the RDS socket send
+ * queue was momentarily full (sendmsg returned EAGAIN/ENOBUFS).
+ *
+ * These are operations the provider *must* complete itself and cannot bounce
+ * back to the application as -FI_EAGAIN: the rendezvous receiver's RDMA READs
+ * and the FIN acks.  If they were simply dropped on a full send queue the
+ * sender would wait forever for a FIN (the "16 KiB hang") or a rendezvous
+ * receive would never complete (the collective-storm hang).  Instead they are
+ * queued in FIFO order on ep->deferred and re-issued from the progress engine
+ * until the socket accepts them.  This converts a send-queue overflow from a
+ * lost message into orderly back-pressure -- the core of the flow-control fix.
+ */
+enum rds_deferred_type {
+	RDS_DEFERRED_FIN = 1,	/* rendezvous FIN ack (receiver -> sender)   */
+	RDS_DEFERRED_READ,	/* rendezvous RDMA READ segment (rx zero-copy)*/
+};
+
+struct rds_deferred {
+	struct dlist_entry	entry;
+	enum rds_deferred_type	type;
+	union ofi_sock_ip	peer;		/* destination of the op       */
+	socklen_t		peerlen;
+
+	uint64_t		id;		/* FIN: id echoed to the sender;
+						 * READ: owning pending-op token */
+
+	/* RDS_DEFERRED_READ payload */
+	rds_rdma_cookie_t	cookie;		/* remote source-buffer cookie */
+	uint64_t		remote_off;	/* offset within that MR       */
+	struct iovec		liov[RDS_IOV_LIMIT];
+	size_t			lcnt;		/* local scatter list count    */
+};
+
+
 /* ------------------------------------------------------------------ */
 /* Eager-ring peer state					      */
 /* ------------------------------------------------------------------ */
@@ -438,6 +522,8 @@ enum rds_peer_state {
 	RDS_PEER_NONE = 0,	/* no ring; use datagram path        */
 	RDS_PEER_CONNECTING,	/* RING_REQ sent, awaiting RING_ACK  */
 	RDS_PEER_READY,		/* ring usable both directions       */
+	RDS_PEER_DISABLED,	/* ring registration failed; this    */
+				/* peer permanently uses datagrams   */
 };
 
 #define RDS_PEER_HASH_SIZE	1024
@@ -448,6 +534,7 @@ struct rds_peer {
 	fi_addr_t		addr;
 	union ofi_sock_ip	sa;
 	enum rds_peer_state	state;
+	uint64_t		connect_start_ms;	/* CONNECTING deadline base */
 
 	/* Local receive ring: the peer RDMA-writes data here; we poll it. */
 	char			*rx_ring;
@@ -491,6 +578,9 @@ struct rds_ep {
 	struct dlist_entry	rx_unexp_msg;	/* struct rds_unexp           */
 	struct dlist_entry	rx_unexp_tag;
 	struct dlist_entry	pending;	/* struct rds_pending         */
+	struct dlist_entry	deferred;	/* struct rds_deferred (FIFO) */
+
+	uint32_t		rndzv_tx_inflight; /* rendezvous sends awaiting FIN */
 
 	uint64_t		op_id;		/* monotonic token allocator  */
 
@@ -519,9 +609,15 @@ extern struct fi_ops_rma rds_rma_ops;
 
 void rds_ep_progress(struct util_ep *util_ep);
 
-/* internal helpers shared between data-path files */
+/* internal helpers shared between data-path files.
+ *
+ * @dest, when non-NULL, is the sockaddr of a connected peer to register the
+ * region against (RDS_GET_MR_FOR_DEST).  Rendezvous source registration always
+ * passes the receiver (which is connected, since we are about to RTS it); app
+ * fi_mr_reg windows pass NULL and fall back to plain RDS_GET_MR.  On failure
+ * the kernel errno is returned through @err_out (negated) when it is non-NULL. */
 struct rds_mr *rds_reg_internal(struct rds_ep *ep, const void *buf, size_t len,
-				uint64_t access);
+				uint64_t access, int *err_out, const void *dest);
 void rds_mr_put(struct rds_mr *mr);
 
 /* Registration cache for rendezvous source buffers (rds_mr.c). */
@@ -530,7 +626,8 @@ void rds_mr_cache_close(struct rds_domain *domain);
 /* Look up / register @buf,@len in the cache; returns the cookie and the entry
  * (whose ref must be dropped with rds_reg_cache_put when the op completes). */
 int rds_reg_cache_get(struct rds_ep *ep, const void *buf, size_t len,
-		      rds_rdma_cookie_t *cookie, struct ofi_mr_entry **entry);
+		      rds_rdma_cookie_t *cookie, struct ofi_mr_entry **entry,
+		      const void *dest, size_t dest_len);
 void rds_reg_cache_put(struct rds_domain *domain, struct ofi_mr_entry *entry);
 
 /* Eager RDMA ring fast path (rds_eager.c). */
@@ -542,7 +639,7 @@ void rds_ep_ring_cleanup(struct rds_ep *ep);
 ssize_t rds_ring_send(struct rds_ep *ep, const struct iovec *iov,
 		      size_t iov_count, fi_addr_t dest, uint64_t tag,
 		      uint64_t data, void *context, uint64_t flags, int tagged,
-		      int gen_comp);
+		      int gen_comp, uint8_t op);
 /* Poll every ready peer ring for arrived slots (called from progress). */
 void rds_ring_progress(struct rds_ep *ep);
 /* Handle a RING_REQ / RING_ACK control datagram. */
@@ -579,6 +676,12 @@ void rds_handle_inbound(struct rds_ep *ep, struct rds_hdr *hdr, void *payload,
 			size_t payload_len, const union ofi_sock_ip *src,
 			fi_addr_t src_fi);
 void rds_handle_rdma_notify(struct rds_ep *ep, uint64_t token, int status);
+
+/* Re-issue parked FINs / rendezvous reads; called first in each progress pass.
+ * Returns 0 if the queue drained, -FI_EAGAIN if the socket is still full. */
+int rds_progress_deferred(struct rds_ep *ep);
+/* Drop every parked op (endpoint teardown). */
+void rds_ep_flush_deferred(struct rds_ep *ep);
 
 /* Slice [off, off+len) of @src into @dst (capped at RDS_IOV_LIMIT entries). */
 size_t rds_iov_slice(struct iovec *dst, size_t *dst_cnt,

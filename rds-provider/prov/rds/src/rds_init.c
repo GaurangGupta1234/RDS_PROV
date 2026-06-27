@@ -13,6 +13,10 @@ int rds_eager_rdma;			/* default: off (datagram eager)  */
 size_t rds_ring_slots = RDS_DEF_RING_SLOTS;
 size_t rds_ring_slot_size = RDS_DEF_RING_SLOT_SIZE;
 size_t rds_ring_max_peers = RDS_DEF_RING_MAX_PEERS;
+int    rds_mr_cache_enable = 1;		/* rendezvous MR cache: on         */
+size_t rds_rndzv_max_inflight = 256;	/* concurrent rendezvous sends cap */
+size_t rds_sndbuf;			/* SO_SNDBUF override (0 = default) */
+size_t rds_rcvbuf;			/* SO_RCVBUF override (0 = default) */
 
 static int rds_pow2(size_t v)
 {
@@ -104,6 +108,39 @@ RDS_INI
 	if (fi_param_get_int(&rds_prov, "ring_max_peers", &val) == FI_SUCCESS &&
 	    val > 0)
 		rds_ring_max_peers = (size_t) val;
+
+	fi_param_define(&rds_prov, "mr_cache", FI_PARAM_BOOL,
+			"Cache rendezvous source-buffer registrations so "
+			"repeated sends from the same buffer skip RDS_GET_MR "
+			"(prevents per-message page pinning / -ENOMEM). "
+			"(default: 1)");
+	val = 1;
+	if (fi_param_get_bool(&rds_prov, "mr_cache", &val) == FI_SUCCESS)
+		rds_mr_cache_enable = !!val;
+
+	fi_param_define(&rds_prov, "rndzv_inflight", FI_PARAM_INT,
+			"Max rendezvous sends in flight per endpoint before "
+			"new ones get -FI_EAGAIN; flow-control against "
+			"many-to-many RTS/FIN storms. (default: 256)");
+	val = 256;
+	if (fi_param_get_int(&rds_prov, "rndzv_inflight", &val) == FI_SUCCESS &&
+	    val > 0)
+		rds_rndzv_max_inflight = (size_t) val;
+
+	fi_param_define(&rds_prov, "sndbuf", FI_PARAM_INT,
+			"SO_SNDBUF on the RDS socket in bytes (0 = leave the "
+			"kernel default). Larger absorbs collective bursts. "
+			"(default: 0)");
+	val = 0;
+	if (fi_param_get_int(&rds_prov, "sndbuf", &val) == FI_SUCCESS && val > 0)
+		rds_sndbuf = (size_t) val;
+
+	fi_param_define(&rds_prov, "rcvbuf", FI_PARAM_INT,
+			"SO_RCVBUF on the RDS socket in bytes (0 = leave the "
+			"kernel default). (default: 0)");
+	val = 0;
+	if (fi_param_get_int(&rds_prov, "rcvbuf", &val) == FI_SUCCESS && val > 0)
+		rds_rcvbuf = (size_t) val;
 
 	return &rds_prov;
 }

@@ -54,7 +54,15 @@ void rds_ep_progress(struct util_ep *util_ep)
 
 	ofi_genlock_lock(&ep->util_ep.lock);
 
-	/* Fast path first: poll the memory-mapped eager rings (no syscall). */
+	/*
+	 * Retry anything the socket previously rejected (parked FINs and
+	 * rendezvous READs) before generating new work.  This drains the
+	 * back-pressure queue in order and is what turns a momentarily full
+	 * send queue into orderly progress instead of a dropped FIN/read.
+	 */
+	rds_progress_deferred(ep);
+
+	/* Fast path: poll the memory-mapped eager rings (no syscall). */
 	rds_ring_progress(ep);
 
 	while (budget--) {

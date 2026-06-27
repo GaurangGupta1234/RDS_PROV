@@ -28,6 +28,17 @@ touching the kernel.
 If (1)–(4) hold, eager messaging, rendezvous, and RMA all work — subject to the
 1 MiB ceiling below.
 
+> **v3 registration note.** The provider registers rendezvous source buffers
+> with **`RDS_GET_MR_FOR_DEST` (opt 7)** rather than plain `RDS_GET_MR`, because
+> that is what succeeds on the target box. In upstream `net/rds/rdma.c` the two
+> are the *same* call — `rds_get_mr_for_dest()` ignores `dest_addr` and forwards
+> to `__rds_rdma_map()` (comment: *"Initially, just behave like get_mr()."*) — so
+> the "`rds_get_mr` doesn't work but `rds_get_mr_for_dest` does" symptom is an
+> ABI/struct-size or kernel-vintage quirk at the call site, not a difference in
+> the resulting key. The cookie is `make_cookie(r_key, page_offset)` with **no
+> destination component**, so it is destination-independent and the provider
+> caches it across peers (correct by construction, not an assumption).
+
 ---
 
 ## 1. The 1 MiB message ceiling (copy path)  — `RDS_MAX_MSG_SIZE`
